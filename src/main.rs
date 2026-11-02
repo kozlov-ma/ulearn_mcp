@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             eprintln!(
-                "ulearn-mcp [bootstrap [TOKEN_FILE] [--replace] | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nBootstrap: interactive token setup; use bootstrap --help for instructions.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_TOKEN or ULEARN_TOKEN_FILE, ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nThe default ~/.config/ulearn-mcp/ulearn.token is loaded automatically for api.ulearn.me. Without a token, only public course content is available."
+                "ulearn-mcp [bootstrap [TOKEN_FILE] [--replace] | config | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nBootstrap: interactive token setup; use bootstrap --help for instructions.\nconfig: print MCP client JSON with absolute paths; no token reads or network requests.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_TOKEN or ULEARN_TOKEN_FILE, ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nThe default ~/.config/ulearn-mcp/ulearn.token is loaded automatically for api.ulearn.me. Without a token, only public course content is available."
             );
             return Ok(());
         }
@@ -25,6 +25,14 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::anyhow!("Usage: ulearn-mcp login /absolute/path/ulearn.token")
             })?;
             return login(Path::new(&path)).await;
+        }
+        Some("config") => {
+            anyhow::ensure!(args.len() == 1, "Usage: ulearn-mcp config");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ulearn_mcp::bootstrap::configuration_from_env()?)?
+            );
+            return Ok(());
         }
         Some("--check") => {
             let account = UlearnClient::from_env()?.get(&["account"], &[]).await?;

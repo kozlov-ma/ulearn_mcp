@@ -122,6 +122,30 @@ pub async fn import_token(api_url: &str, input: &str, path: &Path, replace: bool
     Ok(())
 }
 
+fn configured_token_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    explicit
+        .or_else(|| std::env::var_os("ULEARN_TOKEN_FILE").map(PathBuf::from))
+        .map(Ok)
+        .unwrap_or_else(default_token_path)
+}
+
+fn client_config(binary: &Path, token_path: &Path, api: &str) -> Result<serde_json::Value> {
+    ensure!(binary.is_absolute(), "Executable path must be absolute");
+    ensure!(token_path.is_absolute(), "Token file path must be absolute");
+    UlearnClient::new(api, None)?;
+    Ok(
+        serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":{"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api}}}}),
+    )
+}
+
+/// Print-ready configuration without reading tokens or accessing the network.
+/// File authentication is intentional: never serialize ULEARN_TOKEN into config.
+pub fn configuration_from_env() -> Result<serde_json::Value> {
+    let path = configured_token_path(None)?;
+    let api = std::env::var("ULEARN_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
+    client_config(&std::env::current_exe()?, &path, &api)
+}
+
 pub async fn run(args: &[String]) -> Result<()> {
     if args == ["--help"] || args == ["-h"] {
         println!(
@@ -143,10 +167,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             path = Some(PathBuf::from(arg));
         }
     }
-    let path = path
-        .or_else(|| std::env::var_os("ULEARN_TOKEN_FILE").map(PathBuf::from))
-        .map(Ok)
-        .unwrap_or_else(default_token_path)?;
+    let path = configured_token_path(path)?;
     let api = std::env::var("ULEARN_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
     // Validate origin before asking for the secret; a custom server must be visible to the user.
     UlearnClient::new(&api, None)?;
@@ -167,13 +188,13 @@ pub async fn run(args: &[String]) -> Result<()> {
     import_token(&api, &token, &path, replace).await?;
     eprintln!("Токен проверен и сохранён. Комментарии и оценки не изменялись.");
     let binary = std::env::current_exe()?;
-    let config = serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":{"ULEARN_TOKEN_FILE":path,"ULEARN_API_URL":api}}}});
+    let config = client_config(&binary, &path, &api)?;
     println!(
         "Конфигурация для MCP-клиентов с mcpServers (без секретов):\n{}",
         serde_json::to_string_pretty(&config)?
     );
     eprintln!(
-        "При стандартном пути и API токен подхватывается автоматически. Если MCP уже запущен, перезапустите его. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
+        "Повторно вывести JSON настройки: ulearn-mcp config. При стандартном пути и API токен подхватывается автоматически. Если MCP уже запущен, перезапустите его. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
     );
     Ok(())
 }

@@ -1,10 +1,13 @@
 [package]
 name = "ulearn-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Local MCP server for ulearn courses, student submissions and instructor reviews"
 license = "MIT"
+repository = "https://github.com/kozlov-ma/ulearn_mcp"
+readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1"
