@@ -101,38 +101,28 @@ fn relative_token_path_is_rejected_without_secret_leak_or_partial_json() {
 }
 
 #[test]
-fn refresh_and_web_settings_are_preserved_without_reading_secrets() {
+fn refresh_settings_are_preserved_without_reading_secrets() {
     let temporary = tempdir().unwrap();
-    let cookie = temporary.path().join("missing.cookie");
     let output = command(temporary.path())
-        .env("ULEARN_WEB_URL", "https://ulearn.me")
-        .env("ULEARN_WEB_COOKIE_FILE", &cookie)
         .env("ULEARN_TOKEN_REFRESH_DAYS", "7")
         .env("ULEARN_AUTO_REFRESH_TOKEN", "false")
-        .env("ULEARN_WEB_COOKIE", "never-serialize-this-secret")
+        .env("ULEARN_TOKEN", "never-serialize-this-secret")
         .output()
         .unwrap();
     assert!(output.status.success());
     let config: Value = serde_json::from_slice(&output.stdout).unwrap();
     let environment = &config["mcpServers"]["ulearn"]["env"];
-    assert_eq!(
-        environment["ULEARN_WEB_COOKIE_FILE"],
-        cookie.to_str().unwrap()
-    );
     assert_eq!(environment["ULEARN_TOKEN_REFRESH_DAYS"], "7");
     assert_eq!(environment["ULEARN_AUTO_REFRESH_TOKEN"], "false");
-    assert!(environment.get("ULEARN_WEB_COOKIE").is_none());
+    assert!(environment.get("ULEARN_TOKEN").is_none());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("never-serialize-this-secret"));
-    assert!(!cookie.exists());
+    assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
 }
 
 #[test]
 fn invalid_optional_settings_fail_without_partial_configuration() {
     let temporary = tempdir().unwrap();
     for (name, value) in [
-        ("ULEARN_WEB_COOKIE_FILE", "relative.cookie"),
-        ("ULEARN_WEB_URL", "https://user:secret@ulearn.me"),
-        ("ULEARN_WEB_URL", "https://ulearn.me/path"),
         ("ULEARN_AUTO_REFRESH_TOKEN", "maybe"),
         ("ULEARN_TOKEN_REFRESH_DAYS", "0"),
     ] {

@@ -1,6 +1,6 @@
 ---
 name: ulearn-review
-description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignments, code reviews, module scores and activity points.
+description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignments, code reviews, reading module scores and activity points.
 ---
 
 # Ulearn instructor review
@@ -68,11 +68,7 @@ Do not call `manual-checking` to finish a review: it reopens review and is outsi
 
 Use `get_module_scores` for a specific student and optional module/group. Categories come from the course (`activity`, `homework`, etc.); never infer a category ID from its translated label. `slide_score` and `additional_score` are distinct, and no overall weighted grade is implied.
 
-To change points, show the course/module, student, category and exact previous → proposed points. `set_module_score` changes only the additional component, not a review percentage or derived total. Explicit `null` clears the recorded value; zero records zero points. Obtain separate approval of this concrete draft under the publication boundary above.
-
-Re-read the exact module/category before writing. Pass its original `expected_score` and the approved `score`, both required and nullable. Stop on changed state instead of replacing the expected value to force a write. Respect the course maximum and whether the category is editable. Verify `score_verified` and the fresh module data; an accepted but unverified write must be reconciled with `get_module_scores` before further changes.
-
-Additional points use the website session, while reading uses the API token. Ask the user to configure `ulearn-mcp bootstrap-web` in their own terminal when needed, using the same instructor account as the API. Never request tokens/cookies in chat or tool arguments, or claim the API account proves the website session identity. Token renewal does not renew the website session.
+Module/activity points are read-only in this MCP: the verified bearer-token API has no supported mutation for them. Do not use `set_review_score` to simulate changing activity points; it grades a specific submission. Do not request browser cookies or a website session. Token renewal uses the API token only.
 
 ## Interrupted or uncertain publication
 

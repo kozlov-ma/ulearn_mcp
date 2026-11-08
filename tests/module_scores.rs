@@ -1,17 +1,12 @@
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{Value, json};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use ulearn_mcp::{
     client::UlearnClient,
-    server::{ModuleScoreArgs, ModuleScoresArgs, UlearnServer},
-    web_client::UlearnWebClient,
+    server::{ModuleScoresArgs, UlearnServer},
 };
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, body_string, method, path, query_param},
+    matchers::{body_json, method, path, query_param},
 };
 
 fn course() -> Value {
@@ -32,7 +27,7 @@ fn progress(score: Option<i32>) -> Value {
     }
     result
 }
-fn read_args() -> ModuleScoresArgs {
+fn args() -> ModuleScoresArgs {
     ModuleScoresArgs {
         course_id: "course-a".into(),
         user_id: "student-a".into(),
@@ -40,37 +35,23 @@ fn read_args() -> ModuleScoresArgs {
         group_id: None,
     }
 }
-fn write_args() -> ModuleScoreArgs {
-    ModuleScoreArgs {
-        course_id: "course-a".into(),
-        unit_id: "unit-a".into(),
-        user_id: "student-a".into(),
-        scoring_group_id: "activity".into(),
-        score: Some(3),
-        expected_score: Some(1),
-        group_id: None,
-    }
-}
-fn server(api: &MockServer, web: &MockServer) -> UlearnServer {
+fn server(api: &MockServer) -> UlearnServer {
     UlearnServer::new(UlearnClient::new(&api.uri(), Some("synthetic-token".into())).unwrap())
-        .with_web_client(
-            UlearnWebClient::new(&web.uri(), "session=synthetic-cookie".into()).unwrap(),
-        )
 }
-async fn course_mock(api: &MockServer, data: Value, times: u64) {
+async fn course_mock(api: &MockServer, data: Value) {
     Mock::given(method("GET"))
         .and(path("/courses/course-a"))
         .respond_with(ResponseTemplate::new(200).set_body_json(data))
-        .expect(times)
+        .expect(1)
         .mount(api)
         .await;
 }
-async fn progress_mock(api: &MockServer, data: Value, times: u64) {
+async fn progress_mock(api: &MockServer, data: Value) {
     Mock::given(method("POST"))
         .and(path("/user-progress/course-a"))
         .and(body_json(json!({"userIds":["student-a"]})))
         .respond_with(ResponseTemplate::new(200).set_body_json(data))
-        .expect(times)
+        .expect(1)
         .mount(api)
         .await;
 }
@@ -82,34 +63,18 @@ fn category<'a>(result: &'a Value, id: &str) -> &'a Value {
         .find(|g| g["id"] == id)
         .unwrap()
 }
-async fn score_mutation(web: &MockServer, score: Option<i32>) {
-    let body = format!("score={}", score.map(|v| v.to_string()).unwrap_or_default());
-    Mock::given(method("POST"))
-        .and(path("/Admin/SetAdditionalScore"))
-        .and(query_param("courseId", "course-a"))
-        .and(query_param("unitId", "unit-a"))
-        .and(query_param("userId", "student-a"))
-        .and(query_param("scoringGroupId", "activity"))
-        .and(body_string(body))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"status":"ok","score":score.map(|v|json!(v)).unwrap_or(json!(""))}),
-        ))
-        .expect(1)
-        .mount(web)
-        .await;
-}
 
 #[tokio::test]
 async fn module_read_uses_exact_user_and_keeps_scoring_categories_separate() {
     let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 1).await;
-    progress_mock(&api, progress(None), 1).await;
-    let result = server(&api, &web)
-        .get_module_scores(Parameters(read_args()))
+    course_mock(&api, course()).await;
+    progress_mock(&api, progress(None)).await;
+    let result = server(&api)
+        .get_module_scores(Parameters(args()))
         .await
         .unwrap()
         .0;
+    assert_eq!(result["user_id"], "student-a");
     assert_eq!(result["units"].as_array().unwrap().len(), 1);
     assert_eq!(result["units"][0]["id"], "unit-a");
     assert_eq!(
@@ -120,15 +85,16 @@ async fn module_read_uses_exact_user_and_keeps_scoring_categories_separate() {
     assert_eq!(category(&result, "exercise")["slide_score"], 7);
     assert_eq!(category(&result, "exercise")["score"], 9);
     assert_eq!(category(&result, "exercise")["max_score"], 30);
+    assert_eq!(category(&result, "exercise")["metadata"]["weight"], 2);
     assert_eq!(category(&result, "selfcheck")["score"], 1);
     assert!(result.get("total_score").is_none());
-    assert!(web.received_requests().await.unwrap().is_empty());
+    assert!(result["units"][0]["slides"][1]["progress"].is_null());
+    assert_eq!(api.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn all_modules_and_group_visibility_are_supported() {
     let api = MockServer::start().await;
-    let web = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/courses/course-a"))
         .and(query_param("groupId", "42"))
@@ -136,192 +102,75 @@ async fn all_modules_and_group_visibility_are_supported() {
         .expect(1)
         .mount(&api)
         .await;
-    progress_mock(&api, progress(Some(0)), 1).await;
-    let mut args = read_args();
-    args.unit_id = None;
-    args.group_id = Some(42);
-    let result = server(&api, &web)
-        .get_module_scores(Parameters(args))
+    progress_mock(&api, progress(Some(0))).await;
+    let mut request = args();
+    request.unit_id = None;
+    request.group_id = Some(42);
+    let result = server(&api)
+        .get_module_scores(Parameters(request))
         .await
         .unwrap()
         .0;
+    assert_eq!(result["group_id"], 42);
     assert_eq!(result["units"].as_array().unwrap().len(), 2);
     assert_eq!(category(&result, "activity")["additional_score"], 0);
+    assert_eq!(result["units"][1]["additional_scores"]["activity"], 1);
 }
 
 #[tokio::test]
-async fn unavailable_student_is_not_reported_as_zero() {
-    let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 1).await;
-    progress_mock(&api, json!({"userProgress":{}}), 1).await;
-    let error = server(&api, &web)
-        .get_module_scores(Parameters(read_args()))
-        .await
-        .err()
-        .unwrap();
-    assert!(error.contains("unavailable"));
-}
-
-#[tokio::test]
-async fn stale_score_stops_before_any_website_mutation() {
-    let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 1).await;
-    progress_mock(&api, progress(Some(2)), 1).await;
-    let error = server(&api, &web)
-        .set_module_score(Parameters(write_args()))
-        .await
-        .err()
-        .unwrap();
-    assert!(error.contains("Module score changed"));
-    assert!(web.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn out_of_range_or_disabled_category_stops_before_mutation() {
-    for disabled in [false, true] {
+async fn unavailable_or_incomplete_student_progress_is_not_reported_as_zero() {
+    for data in [
+        json!({"userProgress":{}}),
+        json!({"userProgress":{"student-b":{}}}),
+        json!({"userProgress":{"student-a":{}}}),
+        json!({"userProgress":{"student-a":{"visitedSlides":{}}}}),
+    ] {
         let api = MockServer::start().await;
-        let web = MockServer::start().await;
-        let mut data = course();
-        if disabled {
-            data["units"][0]["additionalScores"][0]["canInstructorSetAdditionalScore"] =
-                json!(false);
-        }
-        course_mock(&api, data, 1).await;
-        progress_mock(&api, progress(Some(1)), 1).await;
-        let mut args = write_args();
-        if !disabled {
-            args.score = Some(5);
-        }
+        course_mock(&api, course()).await;
+        progress_mock(&api, data).await;
         assert!(
-            server(&api, &web)
-                .set_module_score(Parameters(args))
+            server(&api)
+                .get_module_scores(Parameters(args()))
                 .await
                 .is_err()
         );
-        assert!(web.received_requests().await.unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn score_and_clear_are_written_once_then_verified() {
-    for score in [Some(0), Some(3), None] {
+async fn exact_module_must_be_present_and_unambiguous() {
+    for duplicate in [false, true] {
         let api = MockServer::start().await;
-        let web = MockServer::start().await;
-        course_mock(&api, course(), 2).await;
-        let counter = Arc::new(AtomicUsize::new(0));
-        Mock::given(method("POST"))
-            .and(path("/user-progress/course-a"))
-            .and(body_json(json!({"userIds":["student-a"]})))
-            .respond_with(move |_: &wiremock::Request| {
-                ResponseTemplate::new(200).set_body_json(progress(
-                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Some(1)
-                    } else {
-                        score
-                    },
-                ))
-            })
-            .expect(2)
-            .mount(&api)
-            .await;
-        score_mutation(&web, score).await;
-        let mut args = write_args();
-        args.score = score;
-        let result = server(&api, &web)
-            .set_module_score(Parameters(args))
+        let mut data = course();
+        if duplicate {
+            data["units"][1]["id"] = json!("unit-a");
+        } else {
+            data["units"][0]["id"] = json!("other-unit");
+        }
+        course_mock(&api, data).await;
+        progress_mock(&api, progress(Some(1))).await;
+        let error = server(&api)
+            .get_module_scores(Parameters(args()))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(result["write_accepted"], true);
-        assert_eq!(result["score_verified"], true);
-        assert_eq!(web.received_requests().await.unwrap().len(), 1);
+            .err()
+            .unwrap();
+        assert!(error.contains("Exact module not found or ambiguous"));
     }
-}
-
-#[tokio::test]
-async fn failed_readback_does_not_hide_accepted_write_or_retry_it() {
-    let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 2).await;
-    let counter = Arc::new(AtomicUsize::new(0));
-    Mock::given(method("POST"))
-        .and(path("/user-progress/course-a"))
-        .respond_with(move |_: &wiremock::Request| {
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                ResponseTemplate::new(200).set_body_json(progress(Some(1)))
-            } else {
-                ResponseTemplate::new(503)
-            }
-        })
-        .expect(2)
-        .mount(&api)
-        .await;
-    score_mutation(&web, Some(3)).await;
-    let result = server(&api, &web)
-        .set_module_score(Parameters(write_args()))
-        .await
-        .unwrap()
-        .0;
-    assert_eq!(result["write_accepted"], true);
-    assert_eq!(result["score_verified"], false);
-    assert!(result["readback_error"].is_string());
-    assert_eq!(web.received_requests().await.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn missing_or_malformed_preconditions_do_not_allow_writes() {
-    let args = json!({"course_id":"course-a","unit_id":"unit-a","user_id":"student-a","scoring_group_id":"activity","score":1});
-    assert!(serde_json::from_value::<ModuleScoreArgs>(args).is_err());
-    let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 1).await;
-    let mut data = progress(Some(1));
-    data["userProgress"]["student-a"]["additionalScores"]["unit-a"]["activity"] = json!("1");
-    progress_mock(&api, data, 1).await;
-    assert!(
-        server(&api, &web)
-            .set_module_score(Parameters(write_args()))
-            .await
-            .is_err()
-    );
-    assert!(web.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn unchanged_score_is_a_verified_no_op() {
-    let api = MockServer::start().await;
-    let web = MockServer::start().await;
-    course_mock(&api, course(), 1).await;
-    progress_mock(&api, progress(Some(1)), 1).await;
-    let mut args = write_args();
-    args.score = Some(1);
-    let result = server(&api, &web)
-        .set_module_score(Parameters(args))
-        .await
-        .unwrap()
-        .0;
-    assert_eq!(result["changed"], false);
-    assert_eq!(result["score_verified"], true);
-    assert!(web.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn nullable_unscored_course_fields_are_readable() {
     let api = MockServer::start().await;
-    let web = MockServer::start().await;
     let data = json!({"units":[{"id":"unit-a","title":"Introduction","additionalScores":null,
         "slides":[{"id":"lesson-a","title":"Welcome","maxScore":0,"scoringGroup":null}]}]});
-    course_mock(&api, data, 1).await;
+    course_mock(&api, data).await;
     progress_mock(
         &api,
         json!({"userProgress":{"student-a":{"visitedSlides":null,"additionalScores":null}}}),
-        1,
     )
     .await;
-    let result = server(&api, &web)
-        .get_module_scores(Parameters(read_args()))
+    let result = server(&api)
+        .get_module_scores(Parameters(args()))
         .await
         .unwrap()
         .0;
@@ -336,25 +185,57 @@ async fn nullable_unscored_course_fields_are_readable() {
 }
 
 #[tokio::test]
-async fn malformed_or_missing_scoring_categories_cannot_reach_mutation() {
-    for case in 0..4 {
+async fn malformed_scoring_fields_are_rejected() {
+    for case in 0..7 {
         let api = MockServer::start().await;
-        let web = MockServer::start().await;
         let mut data = course();
+        let mut scores = progress(Some(1));
         match case {
             0 => data["units"][0]["slides"][0]["scoringGroup"] = Value::Null,
             1 => data["units"][0]["slides"][0]["scoringGroup"] = json!(true),
             2 => data["units"][0]["additionalScores"] = json!({}),
-            _ => data["units"][0]["additionalScores"] = Value::Null,
+            3 => {
+                data["units"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("additionalScores");
+            }
+            4 => {
+                scores["userProgress"]["student-a"]["additionalScores"]["unit-a"]["activity"] =
+                    json!("1")
+            }
+            5 => {
+                scores["userProgress"]["student-a"]["visitedSlides"]["task-a"]["score"] = json!("7")
+            }
+            _ => scores["userProgress"]["student-a"]["additionalScores"] = json!([]),
         }
-        course_mock(&api, data, 1).await;
-        progress_mock(&api, progress(Some(1)), 1).await;
+        course_mock(&api, data).await;
+        progress_mock(&api, scores).await;
         assert!(
-            server(&api, &web)
-                .set_module_score(Parameters(write_args()))
+            server(&api)
+                .get_module_scores(Parameters(args()))
                 .await
                 .is_err()
         );
-        assert!(web.received_requests().await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn empty_identifiers_are_rejected_without_requests() {
+    let api = MockServer::start().await;
+    for case in 0..3 {
+        let mut request = args();
+        match case {
+            0 => request.course_id = " ".into(),
+            1 => request.user_id = "".into(),
+            _ => request.unit_id = Some(" ".into()),
+        }
+        assert!(
+            server(&api)
+                .get_module_scores(Parameters(request))
+                .await
+                .is_err()
+        );
+    }
+    assert!(api.received_requests().await.unwrap().is_empty());
 }

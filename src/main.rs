@@ -9,13 +9,10 @@ async fn main() -> anyhow::Result<()> {
     if args.first().is_some_and(|a| a == "bootstrap") {
         return ulearn_mcp::bootstrap::run(&args[1..]).await;
     }
-    if args.first().is_some_and(|a| a == "bootstrap-web") {
-        return ulearn_mcp::web_bootstrap::run(&args[1..]).await;
-    }
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             eprintln!(
-                "ulearn-mcp [bootstrap [TOKEN_FILE] [--replace] | bootstrap-web [COOKIE_FILE] [--replace] | config | refresh-token [--days N] | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nBootstrap: interactive token setup; use bootstrap --help for instructions.\nconfig: print MCP client JSON with absolute paths; no token reads or network requests.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_TOKEN or ULEARN_TOKEN_FILE, ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nThe default ~/.config/ulearn-mcp/ulearn.token is loaded automatically for api.ulearn.me. Without a token, only public course content is available."
+                "ulearn-mcp [bootstrap [TOKEN_FILE] [--replace] | config | refresh-token [--days N] | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nBootstrap: interactive token setup; use bootstrap --help for instructions.\nconfig: print MCP client JSON with absolute paths; no token reads or network requests.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_TOKEN or ULEARN_TOKEN_FILE, ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nThe default ~/.config/ulearn-mcp/ulearn.token is loaded automatically for api.ulearn.me. Without a token, only public course content is available."
             );
             return Ok(());
         }

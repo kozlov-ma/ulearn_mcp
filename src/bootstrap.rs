@@ -134,25 +134,13 @@ fn client_config(binary: &Path, token_path: &Path, api: &str) -> Result<serde_js
     ensure!(token_path.is_absolute(), "Token file path must be absolute");
     UlearnClient::new(api, None)?;
     let mut environment = serde_json::json!({"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api});
-    for name in [
-        "ULEARN_WEB_URL",
-        "ULEARN_WEB_COOKIE_FILE",
-        "ULEARN_AUTO_REFRESH_TOKEN",
-        "ULEARN_TOKEN_REFRESH_DAYS",
-    ] {
+    for name in ["ULEARN_AUTO_REFRESH_TOKEN", "ULEARN_TOKEN_REFRESH_DAYS"] {
         let value = match std::env::var(name) {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => continue,
             Err(_) => anyhow::bail!("{name} is not valid UTF-8"),
         };
         match name {
-            "ULEARN_WEB_URL" => {
-                crate::web_client::UlearnWebClient::new(&value, "validation=placeholder".into())?;
-            }
-            "ULEARN_WEB_COOKIE_FILE" => ensure!(
-                Path::new(&value).is_absolute(),
-                "ULEARN_WEB_COOKIE_FILE must be an absolute path"
-            ),
             "ULEARN_AUTO_REFRESH_TOKEN" => ensure!(
                 matches!(value.as_str(), "true" | "false" | "1" | "0"),
                 "ULEARN_AUTO_REFRESH_TOKEN must be true or false"
