@@ -79,7 +79,7 @@ fn normalize_token(input: &str) -> Result<&str> {
 pub async fn import_token(api_url: &str, input: &str, path: &Path, replace: bool) -> Result<()> {
     check_destination(path, replace)?;
     let token = normalize_token(input)?;
-    let client = UlearnClient::new(api_url, Some(token.to_owned()))?;
+    let client = UlearnClient::new(api_url, Some(token.to_owned()))?.without_auto_refresh();
     client
         .get(&["account"], &[])
         .await
@@ -133,9 +133,41 @@ fn client_config(binary: &Path, token_path: &Path, api: &str) -> Result<serde_js
     ensure!(binary.is_absolute(), "Executable path must be absolute");
     ensure!(token_path.is_absolute(), "Token file path must be absolute");
     UlearnClient::new(api, None)?;
-    Ok(
-        serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":{"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api}}}}),
-    )
+    let mut environment = serde_json::json!({"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api});
+    for name in [
+        "ULEARN_WEB_URL",
+        "ULEARN_WEB_COOKIE_FILE",
+        "ULEARN_AUTO_REFRESH_TOKEN",
+        "ULEARN_TOKEN_REFRESH_DAYS",
+    ] {
+        let value = match std::env::var(name) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => continue,
+            Err(_) => anyhow::bail!("{name} is not valid UTF-8"),
+        };
+        match name {
+            "ULEARN_WEB_URL" => {
+                crate::web_client::UlearnWebClient::new(&value, "validation=placeholder".into())?;
+            }
+            "ULEARN_WEB_COOKIE_FILE" => ensure!(
+                Path::new(&value).is_absolute(),
+                "ULEARN_WEB_COOKIE_FILE must be an absolute path"
+            ),
+            "ULEARN_AUTO_REFRESH_TOKEN" => ensure!(
+                matches!(value.as_str(), "true" | "false" | "1" | "0"),
+                "ULEARN_AUTO_REFRESH_TOKEN must be true or false"
+            ),
+            "ULEARN_TOKEN_REFRESH_DAYS" => ensure!(
+                value
+                    .parse::<u32>()
+                    .is_ok_and(|days| (1..=365).contains(&days)),
+                "ULEARN_TOKEN_REFRESH_DAYS must be an integer from 1 to 365"
+            ),
+            _ => unreachable!(),
+        }
+        environment[name] = value.into();
+    }
+    Ok(serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":environment}}}))
 }
 
 /// Print-ready configuration without reading tokens or accessing the network.
@@ -194,7 +226,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         serde_json::to_string_pretty(&config)?
     );
     eprintln!(
-        "Повторно вывести JSON настройки: ulearn-mcp config. При стандартном пути и API токен подхватывается автоматически. Если MCP уже запущен, перезапустите его. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
+        "Повторно вывести JSON настройки: ulearn-mcp config. При стандартном пути и API токен подхватывается автоматически. Запущенный MCP подхватит замену файла токена при следующем запросе. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
     );
     Ok(())
 }

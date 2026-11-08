@@ -1,6 +1,6 @@
 # Контракты ulearn
 
-Проверено 30 октября 2026 года. Источники: текущая [OpenAPI-схема](https://api.ulearn.me/documentation/v1/swagger.json), [Swagger UI](https://api.ulearn.me/documentation/index.html) и опубликованный JavaScript самого ulearn. Наличие маршрута в схеме не заменяет прав преподавателя. Реальные комментарии и оценки для проверки не создавались.
+Базовые контракты проверены 30 октября 2026 года; баллы за модули и продление токена — 8 ноября 2026 года. Источники: текущая [OpenAPI-схема](https://api.ulearn.me/documentation/v1/swagger.json), [Swagger UI](https://api.ulearn.me/documentation/index.html) и опубликованный JavaScript самого ulearn. Наличие маршрута в схеме не заменяет прав преподавателя. Реальные комментарии и оценки для проверки не создавались.
 
 ## HTTP и авторизация
 
@@ -8,7 +8,10 @@
 
 - `POST /account/login`, JSON `{login,password}` → `{status,token}`. CLI сохраняет только JWT. Вход через внешний провайдер этим контрактом не подтверждён.
 - Последующие запросы: `Authorization: Bearer <JWT>`. Такой же подход использован в [официальных скриптах интеграции](https://github.com/kontur-edu/ulearn-scripts/blob/master/src/apis/ulearnApi.ts).
-- Браузер получает JWT через `POST /account/token` с cookie сессии. MCP не извлекает cookie или браузерную сессию.
+- `POST /account/token` — браузерный обмен с cookie сессии; для продления API-токена MCP его не использует.
+- `POST /account/api-token?days=N` с действующим Bearer выдаёт токен преподавателя `{status,token}`. MCP использует 30 дней по умолчанию, допускает 1–365; автоматическое продление выполняется перед запросом при остатке не более пяти минут. Файл перечитывается и заменяется атомарно, обновление в переменной окружения живёт только в памяти. CLI `refresh-token [--days N]` требует файл токена.
+- Отдельного refresh token/grant нет. Истёкший Bearer не восстанавливается: требуется `bootstrap --replace`. На `401` повторов нет. JWT `exp` используется только для планирования, проверку подлинности выполняет сервер. Bootstrap проверяет именно введённый токен без автоматического продления.
+- Разделение cookie-only `/account/token` и instructor `/account/api-token` подтверждено также [историческим исходным кодом AccountController](https://github.com/vvadik/Ulearn/blob/master/src/Web.Api/Controllers/AccountController.cs). Текущая Swagger-схема подтверждает маршруты и `TokenResponse`; реальный выпуск токена при разработке не выполнялся.
 - `GET /account` и `GET /account/roles` возвращают личность и роли. Токен не расширяет права аккаунта.
 
 ## Чтение
@@ -22,6 +25,7 @@
 | `GET /groups/{groupId}/students` | Состав группы. |
 | `GET /review-queue` | Обязательный `courseId`; `studentsFilter`, повторяющиеся `groupIds`, `studentIds`, `slideIds`, `sort`, `count`. Результат: `checkings[]`. |
 | `GET /review-queue/history` | Те же фильтры плюс `minTimestamp`. |
+| `POST /user-progress/{courseId}` | Чтение, несмотря на POST: JSON `{userIds:[userId]}` → `userProgress[userId].visitedSlides` и `additionalScores[unitId][scoringGroupId]`. |
 | `GET /submissions` | `courseId`, `slideId`, `userId`; результат `{submissions,prohibitFurtherManualChecking}`. |
 
 Значения `studentsFilter` в интерфейсе: `all`, `mygroups`, `groupids`, `studentids`; `sort`: `ascending`, `descending`. Элемент очереди содержит `submissionId`, `slideId`, `user`, `timestamp`, `score`, `maxScore`, `lockedBy`, `lockedUntil`, `checkedBy`, `checkedTimestamp`, `reviews`.
@@ -32,7 +36,7 @@
 
 ## Запись
 
-Порядок работы агента задан в [ulearn-review](skills/ulearn-review/SKILL.md): сначала показать конкретный черновик комментариев/ответов и оценки, затем дождаться отдельного явного согласия пользователя, затем публиковать только согласованные действия. Тело этого skill встроено в `initialize.instructions` MCP, а описания трёх инструментов записи повторяют требование согласия. Подтверждение проверяет агент; MCP-сервер не читает переписку и не может технически удостоверить ответ пользователя. Проверки хеша/оценки защищают от устаревшего состояния, но не заменяют согласие.
+Порядок работы агента задан в [ulearn-review](skills/ulearn-review/SKILL.md): сначала показать конкретный черновик комментариев/ответов и оценки, затем дождаться отдельного явного согласия пользователя, затем публиковать только согласованные действия. Тело этого skill встроено в `initialize.instructions` MCP, а описания инструментов записи повторяют требование согласия. Подтверждение проверяет агент; MCP-сервер не читает переписку и не может технически удостоверить ответ пользователя. Проверки хеша/оценки защищают от устаревшего состояния, но не заменяют согласие.
 
 | Маршрут | Тело / параметры | Значение |
 | --- | --- | --- |
@@ -47,6 +51,18 @@
 `POST /submissions/{id}/manual-checking` означает **возобновление** ревью, а не завершение; MCP его не вызывает. Разрешение будущих ревью меняет отдельный `PUT /user-progress/{courseId}/{slideId}/prohibit-further-manual-checking?userId=…&prohibit=…`; выставление оценки через MCP этого не делает.
 
 Интерфейс обрабатывает отказ записи `has_newest_submission` с идентификатором новой попытки. MCP не заменяет выбранную попытку новой; при HTTP-ошибке клиент возвращает статус и не раскрывает произвольное тело ответа. Для восстановления нужно перечитать попытки. Гарантии атомарной проверки версии, транзакции для нескольких комментариев и ключа идемпотентности в опубликованном контракте отсутствуют.
+
+## Баллы за модуль и активность
+
+`get_module_scores` объединяет `GET /courses/{courseId}` (необязательный `groupId`) и `POST /user-progress/{courseId}` для одного точного студента. Структура прогресса подтверждена [официальными скриптами интеграции](https://github.com/kontur-edu/ulearn-scripts/blob/master/src/apis/ulearnApi.ts). `units[].additionalScores[]` задаёт `id`, `canInstructorSetAdditionalScore`, `maxAdditionalScore`; `slides[]` — `scoringGroup` и `maxScore`.
+
+Результат содержит по каждой категории `slide_score`, `additional_score`, `score` (их сумму), `slide_max_score`, `max_additional_score`, `max_score` и метаданные. Пустая дополнительная оценка остаётся `null`, а ноль — числом. Отсутствие записи студента в `userProgress` — ошибка, не нулевой результат. Показываются только видимые модули; веса категорий и правила итоговой оценки не применяются автоматически.
+
+В Swagger нет метода изменения дополнительных баллов студента. Ведомость сайта использует `POST /Admin/SetAdditionalScore?courseId=…&unitId=…&userId=…&scoringGroupId=…`, тело `application/x-www-form-urlencoded`: `score=N`; пустое `score=` очищает значение. Это подтверждено [исходным кодом ведомости](https://github.com/FireFenixKZ/Ulearn/blob/master/src/uLearn.Web.Core/Views/Analytics/UnitSheet.cshtml) и [обработчиком AdminController](https://github.com/FireFenixKZ/Ulearn/blob/master/src/uLearn.Web.Core/Controllers/AdminController.cs) в историческом снимке платформы, а способ отправки формы — текущим JavaScript сайта. Read-only проверка действующего сайта показала, что Bearer без сессии перенаправляется на вход. Реальные баллы при разработке не изменялись.
+
+`set_module_score` записывает только дополнительную составляющую выбранной категории (`activity`, `homework` или другая из курса). Перед записью проверяет `expected_score`, редактируемость и диапазон, затем перечитывает прогресс. `score` и `expected_score` обязательны и допускают `null`. Совпадающее значение возвращает no-op без записи. Проверка не атомарна относительно другого преподавателя; неизвестный результат или ошибка чтения не разрешают повторять запись.
+
+Отдельный HTTP-клиент использует только явно настроенный Cookie сессии сайта (`bootstrap-web`, `ULEARN_WEB_COOKIE_FILE`), никогда не копирует cookie из браузера и не передаёт Bearer на сайт. Файл приватный, без симлинков, перечитывается при использовании. Для нестандартного адреса нужны явные `ULEARN_WEB_URL` и файл cookie; автоматически подставляется только стандартная сессия для стандартной установки. Редиректы и повторы отключены. Импорт проверяет синтаксис, но не действительность сессии и не совпадение её аккаунта с API: пользователь должен настроить один аккаунт в обоих местах. Cookie и тела ошибок не возвращаются в MCP. Права на действие проверяет ulearn.
 
 ## Что нельзя заключать из схемы
 

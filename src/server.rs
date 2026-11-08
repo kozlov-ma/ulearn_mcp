@@ -1,4 +1,4 @@
-use crate::client::UlearnClient;
+use crate::{client::UlearnClient, web_client::UlearnWebClient};
 use anyhow::{Context, Result, ensure};
 use rmcp::schemars;
 use rmcp::{
@@ -36,6 +36,7 @@ fn default_count() -> u32 {
 #[derive(Clone)]
 pub struct UlearnServer {
     client: UlearnClient,
+    web_client: Option<UlearnWebClient>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -123,6 +124,37 @@ pub struct GroupsArgs {
 #[serde(deny_unknown_fields)]
 pub struct GroupArgs {
     pub group_id: u32,
+}
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleScoresArgs {
+    #[serde(default = "default_course")]
+    pub course_id: String,
+    /// Exact student ID from a group roster; never a display name.
+    pub user_id: String,
+    /// Exact module ID from get_course. Omit to read all visible modules.
+    pub unit_id: Option<String>,
+    /// Optional group-specific course visibility/settings.
+    pub group_id: Option<u32>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleScoreArgs {
+    #[serde(default = "default_course")]
+    pub course_id: String,
+    pub unit_id: String,
+    pub user_id: String,
+    /// Exact category ID from get_module_scores (for example activity or homework).
+    pub scoring_group_id: String,
+    /// Additional points, NOT a percentage or the module's total. Explicit null clears the value.
+    #[serde(deserialize_with = "deserialize_percent")]
+    #[schemars(required, extend("type" = ["integer", "null"]))]
+    pub score: Option<i32>,
+    /// Last observed additional_score. Explicit null means no recorded value; distinct from zero.
+    #[serde(deserialize_with = "deserialize_percent")]
+    #[schemars(required, extend("type" = ["integer", "null"]))]
+    pub expected_score: Option<i32>,
+    pub group_id: Option<u32>,
 }
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -239,7 +271,196 @@ fn percent(s: &Value) -> Result<Option<i32>> {
     Ok(Some(i32::try_from(n)?))
 }
 
+fn module_category<'a>(scores: &'a Value, id: &str) -> Result<&'a Value> {
+    let groups = scores["units"][0]["scoring_groups"]
+        .as_array()
+        .context("Module has no scoring categories")?;
+    let matches = groups
+        .iter()
+        .filter(|group| group["id"] == id)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "Exact scoring category not found or ambiguous"
+    );
+    Ok(matches[0])
+}
+
+fn integer_field(value: &Value, key: &str) -> Result<i64> {
+    value[key]
+        .as_i64()
+        .with_context(|| format!("Missing or invalid {key}"))
+}
+
+fn score_map<'a>(
+    value: &'a Value,
+    label: &str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        value
+            .as_object()
+            .map(Some)
+            .with_context(|| format!("Invalid {label}"))
+    }
+}
+
+fn summarize_module_scores(
+    course: &Value,
+    progress: &Value,
+    p: &ModuleScoresArgs,
+) -> Result<Value> {
+    let units = course["units"]
+        .as_array()
+        .context("Course has no units array")?;
+    let user = progress["userProgress"]
+        .get(&p.user_id)
+        .filter(|v| v.is_object())
+        .context("Requested student's progress is unavailable; do not assume zero scores")?;
+    let visited = score_map(
+        user.get("visitedSlides")
+            .context("Student progress has no visitedSlides")?,
+        "visitedSlides",
+    )?;
+    let additional = score_map(
+        user.get("additionalScores")
+            .context("Student progress has no additionalScores")?,
+        "additionalScores",
+    )?;
+    let mut summaries = Vec::new();
+    for unit in units
+        .iter()
+        .filter(|u| p.unit_id.as_ref().is_none_or(|id| u["id"] == *id))
+    {
+        let unit_id = unit["id"].as_str().context("Unit has no ID")?;
+        let unit_scores = additional
+            .and_then(|a| a.get(unit_id))
+            .unwrap_or(&Value::Null);
+        let unit_scores = score_map(unit_scores, "unit additionalScores")?;
+        let slides = unit["slides"]
+            .as_array()
+            .context("Unit has no slides array")?;
+        let configs = match unit
+            .get("additionalScores")
+            .context("Unit has no additionalScores")?
+        {
+            Value::Null => &[][..],
+            Value::Array(configs) => configs.as_slice(),
+            _ => anyhow::bail!("Invalid unit additionalScores: expected an array or null"),
+        };
+        let mut groups = std::collections::BTreeMap::<String, Value>::new();
+        let mut slide_results = Vec::new();
+        for slide in slides {
+            let id = slide["id"].as_str().context("Slide has no ID")?;
+            let max = integer_field(slide, "maxScore")?;
+            ensure!(max >= 0, "Invalid negative maxScore");
+            let group = match slide
+                .get("scoringGroup")
+                .context("Slide has no scoringGroup")?
+            {
+                Value::String(group) => group.as_str(),
+                Value::Null if max == 0 => "",
+                _ => anyhow::bail!("Invalid scoringGroup: scored slides require a category"),
+            };
+            ensure!(
+                !group.is_empty() || max == 0,
+                "Scored slide has no scoring category"
+            );
+            let result = visited.and_then(|v| v.get(id));
+            let score = result
+                .map(|v| integer_field(v, "score"))
+                .transpose()?
+                .unwrap_or(0);
+            slide_results.push(json!({"id":id,"title":slide["title"],"scoring_group_id":group,"max_score":max,"progress":result}));
+            if !group.is_empty() {
+                let entry = groups.entry(group.to_owned()).or_insert_with(|| json!({"id":group,"slide_score":0,"slide_max_score":0,"additional_score":null,"max_additional_score":0,"can_instructor_set_additional_score":false}));
+                entry["slide_score"] = json!(
+                    integer_field(entry, "slide_score")?
+                        .checked_add(score)
+                        .context("Score sum overflow")?
+                );
+                entry["slide_max_score"] = json!(
+                    integer_field(entry, "slide_max_score")?
+                        .checked_add(max)
+                        .context("Score sum overflow")?
+                );
+            }
+        }
+        for config in configs {
+            let id = config["id"]
+                .as_str()
+                .context("Additional score configuration has no ID")?;
+            let max = integer_field(config, "maxAdditionalScore")?;
+            let score = unit_scores.and_then(|v| v.get(id));
+            if let Some(score) = score {
+                ensure!(score.as_i64().is_some(), "Invalid additional score");
+            }
+            let entry = groups
+                .entry(id.to_owned())
+                .or_insert_with(|| json!({"id":id,"slide_score":0,"slide_max_score":0}));
+            entry["additional_score"] = json!(score);
+            entry["max_additional_score"] = json!(max);
+            entry["can_instructor_set_additional_score"] =
+                config["canInstructorSetAdditionalScore"].clone();
+        }
+        for (id, entry) in &mut groups {
+            let metadata = course["scoring"]["groups"]
+                .as_array()
+                .and_then(|gs| gs.iter().find(|g| g["id"] == *id));
+            entry["metadata"] = json!(metadata);
+            entry["score"] = json!(
+                integer_field(entry, "slide_score")?
+                    .checked_add(entry["additional_score"].as_i64().unwrap_or(0))
+                    .context("Score sum overflow")?
+            );
+            entry["max_score"] = json!(
+                integer_field(entry, "slide_max_score")?
+                    .checked_add(integer_field(entry, "max_additional_score")?)
+                    .context("Score sum overflow")?
+            );
+        }
+        summaries.push(json!({"id":unit_id,"title":unit["title"],"scoring_groups":groups.into_values().collect::<Vec<_>>(),"slides":slide_results,"additional_scores":unit_scores}));
+    }
+    ensure!(
+        p.unit_id.is_none() || summaries.len() == 1,
+        "Exact module not found or ambiguous in visible course"
+    );
+    Ok(
+        json!({"course_id":p.course_id,"user_id":p.user_id,"group_id":p.group_id,"units":summaries,"notice":"Scores are grouped by scoring category; no overall grade or weighting is inferred. Null additional_score means no recorded value, distinct from zero. Only course modules visible to this account/group are included."}),
+    )
+}
+
 impl UlearnServer {
+    pub fn with_web_client(mut self, web_client: UlearnWebClient) -> Self {
+        self.web_client = Some(web_client);
+        self
+    }
+
+    async fn module_scores_data(&self, p: &ModuleScoresArgs) -> Result<Value> {
+        ensure!(
+            !p.course_id.trim().is_empty() && !p.user_id.trim().is_empty(),
+            "course_id and user_id are required"
+        );
+        ensure!(
+            p.unit_id.as_ref().is_none_or(|id| !id.trim().is_empty()),
+            "unit_id must not be empty"
+        );
+        let q = p
+            .group_id
+            .map(|id| vec![("groupId".into(), id.to_string())])
+            .unwrap_or_default();
+        let course = self.client.get(&["courses", &p.course_id], &q).await?;
+        let progress = self
+            .client
+            .post_read(
+                &["user-progress", &p.course_id],
+                &[],
+                Some(json!({"userIds":[p.user_id]})),
+            )
+            .await?;
+        summarize_module_scores(&course, &progress, p)
+    }
     async fn submission_data(&self, p: &SubmissionArgs) -> Result<Value> {
         ensure!(
             !p.course_id.trim().is_empty()
@@ -308,6 +529,7 @@ impl UlearnServer {
     pub fn new(client: UlearnClient) -> Self {
         Self {
             client,
+            web_client: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -338,6 +560,58 @@ impl UlearnServer {
             .map(|id| vec![("groupId".into(), id.to_string())])
             .unwrap_or_default();
         output(self.client.get(&["courses", &p.course_id], &q).await)
+    }
+
+    #[tool(
+        description = "Read a student's module points, including activity and other additional scoring categories. Exact user_id required; optional unit_id selects one module. Returns per-category totals, maxima, editable additional-score settings and per-slide progress. Does not invent a weighted overall grade. Read-only, though the upstream progress endpoint uses POST.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn get_module_scores(&self, Parameters(p): Parameters<ModuleScoresArgs>) -> Output {
+        output(self.module_scores_data(&p).await)
+    }
+
+    #[tool(
+        description = "Only call after the user explicitly approves the exact displayed student, module, category and previous-to-new points. Set activity or other additional points for a module, or clear with explicit null. Uses the website session configured privately; never accept cookies in tool arguments. Rechecks expected_score and course limits, then verifies saved progress. This edits a category's additional points, not an arbitrary module total. No automatic mutation retries.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    pub async fn set_module_score(&self, Parameters(p): Parameters<ModuleScoreArgs>) -> Output {
+        output(async {
+            ensure!(!p.scoring_group_id.trim().is_empty(), "scoring_group_id is required");
+            ensure!(p.score.is_none_or(|score| score >= 0), "score must be nonnegative or null");
+            ensure!(p.expected_score.is_none_or(|score| score >= 0), "expected_score must be nonnegative or null");
+            let target = ModuleScoresArgs { course_id:p.course_id.clone(), user_id:p.user_id.clone(), unit_id:Some(p.unit_id.clone()), group_id:p.group_id };
+            let before = self.module_scores_data(&target).await?;
+            let category = module_category(&before, &p.scoring_group_id)?;
+            ensure!(category["can_instructor_set_additional_score"] == true, "This category does not allow instructor-set additional scores");
+            let max = integer_field(category,"max_additional_score")?;
+            ensure!(max >= 0 && p.score.is_none_or(|score| i64::from(score) <= max), "score exceeds max_additional_score");
+            let previous = category["additional_score"].as_i64();
+            ensure!(previous == p.expected_score.map(i64::from), "Module score changed; read module scores and review the draft again");
+            if p.score == p.expected_score {
+                return Ok(json!({"changed":false,"score_verified":true,"module_scores":before}));
+            }
+            let web_client = match &self.web_client {
+                Some(client) => client.clone(),
+                None => UlearnWebClient::from_env()?,
+            };
+            let receipt = web_client.set_additional_score(&p.course_id, &p.unit_id, &p.user_id, &p.scoring_group_id, p.score).await?;
+            let mut result = json!({"write_accepted":true,"receipt":receipt,"score_verified":false,"instruction":"Do not repeat an unverified write; read module scores to reconcile."});
+            match self.module_scores_data(&target).await {
+                Ok(after) => {
+                    match module_category(&after, &p.scoring_group_id) {
+                        Ok(category) => result["score_verified"] = json!(category["additional_score"].as_i64() == p.score.map(i64::from)),
+                        Err(error) => result["verification_error"] = json!(error.to_string()),
+                    }
+                    result["module_scores"] = after;
+                }
+                Err(error) => result["readback_error"] = json!(error.to_string()),
+            }
+            Ok(result)
+        }.await)
     }
 
     #[tool(

@@ -1,6 +1,6 @@
 ---
 name: ulearn-review
-description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignment, submission, and code-review tasks.
+description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignments, code reviews, module scores and activity points.
 ---
 
 # Ulearn instructor review
@@ -63,6 +63,16 @@ After displaying the complete draft, ask which numbered actions the user approve
 7. Re-read the result and confirm the saved percentage. Report verified actions with IDs and the final score; distinguish accepted writes from verified writes.
 
 Do not call `manual-checking` to finish a review: it reopens review and is outside this workflow. Do not change permissions for future reviews.
+
+## Module and activity points
+
+Use `get_module_scores` for a specific student and optional module/group. Categories come from the course (`activity`, `homework`, etc.); never infer a category ID from its translated label. `slide_score` and `additional_score` are distinct, and no overall weighted grade is implied.
+
+To change points, show the course/module, student, category and exact previous → proposed points. `set_module_score` changes only the additional component, not a review percentage or derived total. Explicit `null` clears the recorded value; zero records zero points. Obtain separate approval of this concrete draft under the publication boundary above.
+
+Re-read the exact module/category before writing. Pass its original `expected_score` and the approved `score`, both required and nullable. Stop on changed state instead of replacing the expected value to force a write. Respect the course maximum and whether the category is editable. Verify `score_verified` and the fresh module data; an accepted but unverified write must be reconciled with `get_module_scores` before further changes.
+
+Additional points use the website session, while reading uses the API token. Ask the user to configure `ulearn-mcp bootstrap-web` in their own terminal when needed, using the same instructor account as the API. Never request tokens/cookies in chat or tool arguments, or claim the API account proves the website session identity. Token renewal does not renew the website session.
 
 ## Interrupted or uncertain publication
 

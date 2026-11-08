@@ -15,7 +15,7 @@ parser.add_argument('--live', action='store_true')
 args = parser.parse_args()
 env = dict(os.environ)
 # Public smoke never reads local credentials or student records.
-for name in ('ULEARN_TOKEN', 'ULEARN_TOKEN_FILE', 'ULEARN_API_URL'):
+for name in ('ULEARN_TOKEN', 'ULEARN_TOKEN_FILE', 'ULEARN_API_URL', 'ULEARN_WEB_URL', 'ULEARN_WEB_COOKIE_FILE', 'ULEARN_AUTO_REFRESH_TOKEN', 'ULEARN_TOKEN_REFRESH_DAYS'):
     env.pop(name, None)
 smoke_config = tempfile.TemporaryDirectory(prefix='ulearn-smoke-')
 env['XDG_CONFIG_HOME'] = smoke_config.name
@@ -53,10 +53,12 @@ try:
     send(dict(method='notifications/initialized'))
     tools = call('tools/list', {})['tools']
     names = {t['name'] for t in tools}
-    assert {'get_course','get_slide','get_submissions','list_review_queue','get_review_context','add_review_comment','reply_to_review','set_review_score'} <= names
+    assert {'get_course','get_slide','get_submissions','list_review_queue','get_review_context','add_review_comment','reply_to_review','set_review_score','get_module_scores','set_module_score'} <= names
     for tool in tools:
-        if tool['name'] in {'add_review_comment','reply_to_review','set_review_score'}:
+        if tool['name'] in {'add_review_comment','reply_to_review','set_review_score','set_module_score'}:
             assert tool['annotations']['readOnlyHint'] is False
+        if tool['name'] == 'get_module_scores':
+            assert tool['annotations']['readOnlyHint'] is True
     if args.live:
         result = call('tools/call', dict(name='get_course', arguments={'course_id':'nand2tetris'}))
         assert not result.get('isError'), result
