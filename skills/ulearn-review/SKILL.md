@@ -1,13 +1,13 @@
 ---
 name: ulearn-review
-description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignment, submission, and code-review tasks.
+description: Review student submissions and prepare instructor feedback through ulearn MCP; publish comments, replies, or grades only after the user separately approves the exact displayed draft. Use for ulearn assignments, code reviews, module scores and activity points.
 ---
 
 # Ulearn instructor review
 
 ## Publication boundary
 
-Never automatically publish comments, replies, or scores. First show a concrete draft for an exact attempt, then wait for a separate explicit user reply approving the displayed actions.
+Never automatically publish comments, replies, or scores. First show a concrete draft for an exact attempt or student/module/category, then wait for a separate explicit user reply approving the displayed actions.
 
 This is an agent workflow rule for student-visible ulearn writes. The MCP server cannot establish conversational approval; its HTTP preconditions check remote state, not human consent. This rule does not impose approval on unrelated local edits.
 
@@ -64,8 +64,28 @@ After displaying the complete draft, ask which numbered actions the user approve
 
 Do not call `manual-checking` to finish a review: it reopens review and is outside this workflow. Do not change permissions for future reviews.
 
+## Authentication and account continuity
+
+The recommended setup is one private session imported by the user with `ulearn-mcp bootstrap-session [SESSION_FILE] [--replace]` in their own terminal. Never request cookie or token contents in chat, MCP arguments, or approval drafts. `config --session` prints the secret-free MCP configuration; users migrating from token-only setup must replace the old entry and restart the connection, removing old explicit token settings. Explicit `ULEARN_SESSION_FILE` and explicit token settings cannot be combined.
+
+The session supplies both API authentication and website grade writes. The server obtains a JWT through `/account/token`, verifies the account, and caches it only in memory. It renews before expiry with a margin of up to five minutes (half the remaining lifetime at issuance for shorter-lived tokens), or after expiry while the cookie is valid. An API 401 invalidates the cached JWT without retrying the current operation; only a subsequent operation exchanges the session again. `refresh-token` can force a fresh exchange; `--days` belongs only to legacy token mode. The cookie itself is not automatically renewed and Set-Cookie responses are not stored. If the session expires, ask the user to renew it locally with `bootstrap-session --replace`; never collect the secret yourself.
+
+A replacement session for the same account is reloaded automatically. A different account requires restarting MCP and reading the relevant context again. In session mode, each mutation pins the authenticated account/session throughout preflight, write and readback. If the session changes during an operation, stop and reconcile the target; do not retry a possibly accepted write. Recheck `get_account` if the publishing identity may have changed. No browser access, credential entry or unrelated configuration action is itself permission to publish grades.
+
+Legacy `bootstrap`/`ULEARN_TOKEN_FILE`/`ULEARN_TOKEN` setup remains supported for API reading and review writes. It cannot publish additional module points. Do not combine a token account with an independently supplied website cookie. For a custom installation, API URL, website URL and session file must be explicitly configured together.
+
+## Module and activity points
+
+Use `get_module_scores` for a specific student and optional module/group. Categories come from the course (`activity`, `homework`, etc.); never infer a category ID from its translated label. `slide_score` and `additional_score` are distinct, and no overall weighted grade is implied.
+
+For a requested additional-score change, show a draft identifying the instructor account, student, course, module, category, previous value, proposed value, applicable maximum and grading rationale. Use raw integer points, not review percentages. Explain a proposed clearing as removal of the recorded additional score: explicit `null` is different from zero. Wait for a separate explicit reply approving this exact change under the publication boundary above.
+
+Before publishing, read `get_module_scores` again and confirm the exact IDs, previous `additional_score`, category permission and maximum. If the value or relevant context changed, stop and revise the draft; do not replace the expected value merely to bypass a stale-state error. Call `set_module_score` with exact `course_id`, `unit_id`, `user_id`, `scoring_group_id`, approved `score`, observed `expected_score` and the same optional `group_id`. Both score fields are required; use explicit null for an absent previous value or an approved clearing. Never use `set_review_score` to simulate activity points.
+
+`set_module_score` requires the shared session mode. It checks the previous value and course limits, writes through the website gradebook with that same session, and verifies via API progress. Treat only `score_verified: true` as verified. An unchanged score may return `changed: false` without a write. For accepted but unverified results, re-read module scores before any further mutation and report the uncertainty; do not automatically repeat the write.
+
 ## Interrupted or uncertain publication
 
 Never blindly retry a write after a timeout, API error with unknown outcome, or failed readback. A successful HTTP response or `write_accepted: true` alone does not prove the expected comment or grade is visible.
 
-Stop the remaining batch when a write or its verification is uncertain, especially before scoring. Re-read the exact attempt to reconcile. Report which actions are verified, which were accepted but unverified, and which were not attempted; preserve returned IDs. Do not duplicate a possibly saved comment or delete previous writes to simulate rollback. Resume only actions whose outstanding status is established and whose original approval still applies; obtain new approval for any revised action.
+Stop the remaining batch when a write or its verification is uncertain, especially before scoring. Re-read the exact attempt or module scores to reconcile. Report which actions are verified, which were accepted but unverified, and which were not attempted; preserve returned IDs. Do not duplicate a possibly saved comment or delete previous writes to simulate rollback. Resume only actions whose outstanding status is established and whose original approval still applies; obtain new approval for any revised action.

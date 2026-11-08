@@ -99,3 +99,161 @@ fn relative_token_path_is_rejected_without_secret_leak_or_partial_json() {
     assert!(!error.contains(secret));
     assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn refresh_settings_are_preserved_without_reading_secrets() {
+    let temporary = tempdir().unwrap();
+    let output = command(temporary.path())
+        .env("ULEARN_TOKEN_REFRESH_DAYS", "7")
+        .env("ULEARN_AUTO_REFRESH_TOKEN", "false")
+        .env("ULEARN_TOKEN", "never-serialize-this-secret")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let environment = &config["mcpServers"]["ulearn"]["env"];
+    assert_eq!(environment["ULEARN_TOKEN_REFRESH_DAYS"], "7");
+    assert_eq!(environment["ULEARN_AUTO_REFRESH_TOKEN"], "false");
+    assert!(environment.get("ULEARN_TOKEN").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("never-serialize-this-secret"));
+    assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn invalid_optional_settings_fail_without_partial_configuration() {
+    let temporary = tempdir().unwrap();
+    for (name, value) in [
+        ("ULEARN_AUTO_REFRESH_TOKEN", "maybe"),
+        ("ULEARN_TOKEN_REFRESH_DAYS", "0"),
+    ] {
+        let output = command(temporary.path()).env(name, value).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+    }
+}
+
+#[test]
+fn session_config_before_bootstrap_is_pure_and_replaces_legacy_auth_settings() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path().join("not-created");
+    let output = command(&root)
+        .arg("--session")
+        .env("ULEARN_TOKEN", "never-serialize-this-token")
+        .env("ULEARN_TOKEN_FILE", "/old/ulearn.token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let environment = &config["mcpServers"]["ulearn"]["env"];
+    assert_eq!(
+        environment["ULEARN_SESSION_FILE"],
+        root.join("ulearn-mcp/ulearn.cookie").to_str().unwrap()
+    );
+    assert_eq!(environment["ULEARN_API_URL"], "https://api.ulearn.me");
+    assert_eq!(environment["ULEARN_WEB_URL"], "https://ulearn.me");
+    assert!(environment.get("ULEARN_TOKEN").is_none());
+    assert!(environment.get("ULEARN_TOKEN_FILE").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("never-serialize-this-token"));
+    assert!(!root.exists());
+}
+
+#[test]
+fn explicit_session_configuration_does_not_need_home_or_an_existing_file() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ulearn-mcp"))
+        .arg("config")
+        .env_clear()
+        .env("ULEARN_SESSION_FILE", "/missing/private/ulearn.cookie")
+        .env("ULEARN_API_URL", "http://127.0.0.1:9/api")
+        .env("ULEARN_WEB_URL", "http://127.0.0.1:10")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let environment = &config["mcpServers"]["ulearn"]["env"];
+    assert_eq!(
+        environment["ULEARN_SESSION_FILE"],
+        "/missing/private/ulearn.cookie"
+    );
+    assert_eq!(environment["ULEARN_API_URL"], "http://127.0.0.1:9/api");
+    assert_eq!(environment["ULEARN_WEB_URL"], "http://127.0.0.1:10");
+}
+
+#[test]
+fn ambiguous_explicit_authentication_is_rejected_without_partial_config() {
+    let dir = tempdir().unwrap();
+    let output = command(dir.path())
+        .env("ULEARN_SESSION_FILE", "/missing/session.cookie")
+        .env("ULEARN_TOKEN", "private-token")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not both"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-token"));
+}
+
+#[test]
+fn default_session_wins_default_token_but_explicit_token_wins_default_session() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("ulearn-mcp");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("ulearn.cookie"),
+        "intentionally-invalid-not-read",
+    )
+    .unwrap();
+    fs::write(config_dir.join("ulearn.token"), "private-token").unwrap();
+    let output = command(dir.path()).output().unwrap();
+    assert!(output.status.success());
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        config["mcpServers"]["ulearn"]["env"]
+            .get("ULEARN_SESSION_FILE")
+            .is_some()
+    );
+    let output = command(dir.path())
+        .env("ULEARN_TOKEN_FILE", "/explicit/ulearn.token")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let environment = &config["mcpServers"]["ulearn"]["env"];
+    assert_eq!(environment["ULEARN_TOKEN_FILE"], "/explicit/ulearn.token");
+    assert!(environment.get("ULEARN_SESSION_FILE").is_none());
+}
+
+#[test]
+fn custom_session_targets_require_an_explicit_destination_pair_and_file() {
+    let dir = tempdir().unwrap();
+    for environment in [
+        vec![("ULEARN_API_URL", "https://api.example.test")],
+        vec![
+            ("ULEARN_API_URL", "https://api.example.test"),
+            ("ULEARN_WEB_URL", "https://example.test"),
+        ],
+        vec![("ULEARN_WEB_URL", "https://example.test")],
+        vec![
+            ("ULEARN_WEB_URL", "https://example.test"),
+            ("ULEARN_SESSION_FILE", "/missing/session.cookie"),
+        ],
+    ] {
+        let output = command(dir.path())
+            .arg("--session")
+            .envs(environment)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("explicit"));
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}

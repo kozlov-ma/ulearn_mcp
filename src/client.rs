@@ -4,20 +4,37 @@
 //! particular, failed writes are never retried: a lost response does not imply
 //! that a comment or a grade was not saved.
 
-use anyhow::{Context, Result, bail};
+use crate::session::{SessionSnapshot, UlearnSession};
+use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Method, StatusCode, Url, header};
 use serde_json::Value;
-use std::{env, fs, io::Read, path::Path, time::Duration};
+use std::{
+    env, fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::Mutex;
 
 const DEFAULT_API_URL: &str = "https://api.ulearn.me";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+const REFRESH_BEFORE_SECONDS: u64 = 300;
+pub const DEFAULT_REFRESH_DAYS: u32 = 30;
 
 #[derive(Clone)]
 pub struct UlearnClient {
     client: Client,
     base_url: Url,
-    authenticated: bool,
+    session: Option<UlearnSession>,
+    pinned_session: Option<SessionSnapshot>,
+    token: Arc<Mutex<Option<String>>>,
+    refresh_denied_token: Arc<Mutex<Option<String>>>,
+    token_file: Option<PathBuf>,
+    refresh_days: u32,
+    auto_refresh: bool,
 }
 
 impl UlearnClient {
@@ -26,27 +43,92 @@ impl UlearnClient {
             optional_env("ULEARN_API_URL")?.unwrap_or_else(|| DEFAULT_API_URL.to_owned());
         let direct_token = optional_env("ULEARN_TOKEN")?;
         let token_file = optional_env("ULEARN_TOKEN_FILE")?;
-        let token = match (direct_token, token_file) {
+        if let Some(session) = crate::session::session_from_env(
+            &base_url,
+            direct_token.is_some() || token_file.is_some(),
+        )? {
+            return Self::from_session(session);
+        }
+        let token_file = match (direct_token.as_ref(), token_file) {
             (Some(_), Some(_)) => bail!("Set only one of ULEARN_TOKEN or ULEARN_TOKEN_FILE"),
-            (Some(token), None) => Some(token),
-            (None, Some(path)) => Some(read_token_file(Path::new(&path))?),
-            (None, None) => {
-                // Never implicitly forward a production credential to a custom API.
-                if base_url.trim_end_matches('/') == DEFAULT_API_URL {
-                    match crate::bootstrap::default_token_path() {
-                        Ok(path) => match fs::symlink_metadata(&path) {
-                            Ok(_) => Some(read_token_file(&path)?),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                            Err(_) => bail!("Could not inspect default token file"),
-                        },
-                        Err(_) => None,
-                    }
-                } else {
-                    None
+            (_, Some(path)) => Some(PathBuf::from(path)),
+            (None, None) if base_url.trim_end_matches('/') == DEFAULT_API_URL => {
+                match crate::bootstrap::default_token_path() {
+                    Ok(path) => match fs::symlink_metadata(&path) {
+                        Ok(_) => Some(path),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(_) => bail!("Could not inspect default token file"),
+                    },
+                    Err(_) => None,
                 }
             }
+            _ => None,
         };
-        Self::new(&base_url, token)
+        let mut client = if let Some(path) = token_file {
+            Self::from_token_file(&base_url, path)?
+        } else {
+            Self::new(&base_url, direct_token)?
+        };
+        if let Some(days) = optional_env("ULEARN_TOKEN_REFRESH_DAYS")? {
+            client.refresh_days = days
+                .parse()
+                .context("ULEARN_TOKEN_REFRESH_DAYS must be an integer from 1 to 365")?;
+            validate_refresh_days(client.refresh_days)?;
+        }
+        client.auto_refresh = match optional_env("ULEARN_AUTO_REFRESH_TOKEN")?.as_deref() {
+            None | Some("true" | "1") => true,
+            Some("false" | "0") => false,
+            _ => bail!("ULEARN_AUTO_REFRESH_TOKEN must be true or false"),
+        };
+        Ok(client)
+    }
+
+    pub fn from_session(session: UlearnSession) -> Result<Self> {
+        let mut client = Self::new(session.api_url(), None)?;
+        client.session = Some(session);
+        Ok(client)
+    }
+
+    pub fn from_session_file(api_url: &str, web_url: &str, path: PathBuf) -> Result<Self> {
+        Self::from_session(UlearnSession::from_file(api_url, web_url, path)?)
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    pub async fn pin_session(&self) -> Result<Self> {
+        let session = self.session.as_ref().context("Module score editing requires a website session; run bootstrap-session and configure ULEARN_SESSION_FILE")?;
+        if let Some(snapshot) = &self.pinned_session {
+            snapshot.ensure_current()?;
+            return Ok(self.clone());
+        }
+        let snapshot = session.authenticate(false).await?;
+        let mut client = self.clone();
+        client.pinned_session = Some(snapshot);
+        Ok(client)
+    }
+
+    pub fn session_snapshot(&self) -> Option<SessionSnapshot> {
+        self.pinned_session.clone()
+    }
+
+    pub fn from_token_file(base_url: &str, path: PathBuf) -> Result<Self> {
+        ensure!(path.is_absolute(), "Token file path must be absolute");
+        let token = read_token_file(&path)?;
+        let mut client = Self::new(base_url, Some(token))?;
+        client.token_file = Some(path);
+        Ok(client)
+    }
+
+    /// Bootstrap verifies exactly the imported token without silently replacing it.
+    pub fn without_auto_refresh(mut self) -> Self {
+        self.auto_refresh = false;
+        self
+    }
+
+    pub fn has_token_file(&self) -> bool {
+        self.token_file.is_some()
     }
 
     pub fn new(base_url: &str, token: Option<String>) -> Result<Self> {
@@ -62,17 +144,7 @@ impl UlearnClient {
             header::ACCEPT,
             header::HeaderValue::from_static("application/json"),
         );
-        let authenticated = token.is_some();
-        if let Some(token) = token {
-            let token = token.trim();
-            if token.is_empty() || token.len() > MAX_TOKEN_BYTES as usize {
-                bail!("Ulearn token is empty or too large");
-            }
-            let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| anyhow::anyhow!("Ulearn token contains invalid header characters"))?;
-            authorization.set_sensitive(true);
-            headers.insert(header::AUTHORIZATION, authorization);
-        }
+        let token = token.map(|value| validate_token(&value)).transpose()?;
         let client = Client::builder()
             .default_headers(headers)
             .user_agent(concat!("ulearn-mcp/", env!("CARGO_PKG_VERSION")))
@@ -85,12 +157,19 @@ impl UlearnClient {
         Ok(Self {
             client,
             base_url,
-            authenticated,
+            session: None,
+            pinned_session: None,
+            token: Arc::new(Mutex::new(token)),
+            refresh_denied_token: Arc::new(Mutex::new(None)),
+            token_file: None,
+            refresh_days: DEFAULT_REFRESH_DAYS,
+            auto_refresh: true,
         })
     }
 
     pub async fn get(&self, segments: &[&str], query: &[(String, String)]) -> Result<Value> {
-        self.request(Method::GET, segments, query, None).await
+        self.request(Method::GET, segments, query, None, false)
+            .await
     }
 
     pub async fn post(
@@ -99,11 +178,136 @@ impl UlearnClient {
         query: &[(String, String)],
         body: Option<Value>,
     ) -> Result<Value> {
-        self.request(Method::POST, segments, query, body).await
+        self.request(Method::POST, segments, query, body, true)
+            .await
     }
 
     pub async fn put(&self, segments: &[&str], query: &[(String, String)]) -> Result<Value> {
-        self.request(Method::PUT, segments, query, None).await
+        self.request(Method::PUT, segments, query, None, true).await
+    }
+
+    /// The user-progress API uses POST for a read-only query.
+    pub async fn post_read(
+        &self,
+        segments: &[&str],
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> Result<Value> {
+        self.request(Method::POST, segments, query, body, false)
+            .await
+    }
+
+    /// Renew an unexpired instructor token; never return the credential to callers.
+    pub async fn refresh_token(&self, days: Option<u32>) -> Result<Value> {
+        if let Some(session) = &self.session {
+            ensure!(
+                days.is_none(),
+                "--days is only available for legacy bearer tokens; session token lifetime is controlled by ulearn"
+            );
+            return session.refresh().await;
+        }
+        let days = days.unwrap_or(self.refresh_days);
+        validate_refresh_days(days)?;
+        let mut token = self.token.lock().await;
+        self.reload_token(&mut token)?;
+        self.renew_token(&mut token, days).await
+    }
+
+    fn reload_token(&self, token: &mut Option<String>) -> Result<()> {
+        if let Some(path) = &self.token_file {
+            *token = Some(validate_token(&read_token_file(path)?)?);
+        }
+        Ok(())
+    }
+
+    async fn prepared_token(&self) -> Result<Option<String>> {
+        if let Some(snapshot) = &self.pinned_session {
+            snapshot.ensure_current()?;
+            return Ok(Some(snapshot.bearer_token().to_owned()));
+        }
+        if let Some(session) = &self.session {
+            let snapshot = session.authenticate(false).await?;
+            snapshot.ensure_current()?;
+            return Ok(Some(snapshot.bearer_token().to_owned()));
+        }
+        let mut token = self.token.lock().await;
+        self.reload_token(&mut token)?;
+        if self.auto_refresh
+            && token
+                .as_deref()
+                .and_then(jwt_expiry)
+                .is_some_and(|expiry| expiry <= unix_now().saturating_add(REFRESH_BEFORE_SECONDS))
+        {
+            ensure!(
+                token
+                    .as_deref()
+                    .and_then(jwt_expiry)
+                    .is_some_and(|expiry| expiry > unix_now()),
+                "Token has expired; run ulearn-mcp bootstrap --replace. Expired bearer tokens cannot be renewed without signing in again"
+            );
+            let mut denied = self.refresh_denied_token.lock().await;
+            if denied.as_deref() != token.as_deref()
+                && let Err(error) = self.renew_token(&mut token, self.refresh_days).await
+            {
+                // Only instructors can mint API tokens. A still-valid token may
+                // nevertheless authorize reads; don't block those or hammer renewal.
+                let forbidden = error
+                    .downcast_ref::<HttpStatusError>()
+                    .is_some_and(|error| error.status == StatusCode::FORBIDDEN);
+                if forbidden
+                    && token
+                        .as_deref()
+                        .and_then(jwt_expiry)
+                        .is_some_and(|expiry| expiry > unix_now())
+                {
+                    *denied = token.clone();
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(token.clone())
+    }
+
+    async fn renew_token(&self, token: &mut Option<String>, days: u32) -> Result<Value> {
+        let previous = token
+            .as_deref()
+            .context("Token refresh requires a configured instructor token")?;
+        ensure!(
+            jwt_expiry(previous).is_none_or(|expiry| expiry > unix_now()),
+            "Token has expired; run ulearn-mcp bootstrap --replace. Expired bearer tokens cannot be renewed without signing in again"
+        );
+        let response = self
+            .send_request(
+                Method::POST,
+                &["account", "api-token"],
+                &[("days".into(), days.to_string())],
+                None,
+                Some(previous),
+                false,
+            )
+            .await
+            .context("Token renewal failed; the original operation was not sent")?;
+        let next = validate_token(
+            response
+                .get("token")
+                .and_then(Value::as_str)
+                .context("Token renewal did not return a token")?,
+        )?;
+        // Claims are only a scheduling hint, never authentication or authorization.
+        let expiry =
+            jwt_expiry(&next).context("Token renewal did not return a JWT with an expiry")?;
+        ensure!(
+            expiry > unix_now().saturating_add(REFRESH_BEFORE_SECONDS),
+            "Token renewal returned an expired or too short-lived token"
+        );
+        if let Some(path) = &self.token_file {
+            persist_refreshed_token(path, previous, &next)?;
+        }
+        *token = Some(next);
+        Ok(
+            serde_json::json!({"refreshed":true,"expires_at":expiry,"persisted":self.token_file.is_some()}),
+        )
     }
 
     /// Exchange credentials with ulearn directly. The caller must keep the
@@ -118,6 +322,7 @@ impl UlearnClient {
                 &["account", "login"],
                 &[],
                 Some(serde_json::json!({"login": login, "password": password})),
+                true,
             )
             .await?;
         let token = response
@@ -165,14 +370,50 @@ impl UlearnClient {
         segments: &[&str],
         query: &[(String, String)],
         body: Option<Value>,
+        write: bool,
     ) -> Result<Value> {
-        let write = method != Method::GET;
         let login_request = method == Method::POST && segments == ["account", "login"];
-        if write && !self.authenticated && !login_request {
-            bail!("Ulearn writes require ULEARN_TOKEN or ULEARN_TOKEN_FILE");
+        let token = if login_request {
+            None
+        } else {
+            self.prepared_token().await?
+        };
+        if method != Method::GET && token.is_none() && !login_request {
+            bail!("Ulearn writes require a website session or ULEARN_TOKEN/ULEARN_TOKEN_FILE");
         }
+        let result = self
+            .send_request(method, segments, query, body, token.as_deref(), write)
+            .await;
+        if let Err(error) = &result
+            && error
+                .downcast_ref::<HttpStatusError>()
+                .is_some_and(|error| error.status == StatusCode::UNAUTHORIZED)
+            && let (Some(session), Some(rejected)) = (&self.session, token.as_deref())
+        {
+            // Never replay this operation, especially writes. A later independent
+            // call may exchange the cookie again for a fresh API token.
+            session.invalidate_token(rejected).await;
+        }
+        result
+    }
+
+    async fn send_request(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(String, String)],
+        body: Option<Value>,
+        token: Option<&str>,
+        write: bool,
+    ) -> Result<Value> {
         let url = self.url(segments, query)?;
         let mut request = self.client.request(method, url);
+        if let Some(token) = token {
+            let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("Invalid token header"))?;
+            value.set_sensitive(true);
+            request = request.header(header::AUTHORIZATION, value);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -193,7 +434,7 @@ impl UlearnClient {
             if write && status.is_server_error() {
                 return Err(outcome_error(&reason, true));
             }
-            bail!("{reason}");
+            return Err(HttpStatusError { status }.into());
         }
         if response
             .content_length()
@@ -242,6 +483,72 @@ impl UlearnClient {
         }
         Ok(value)
     }
+}
+
+fn validate_token(value: &str) -> Result<String> {
+    let token = value.trim();
+    ensure!(
+        !token.is_empty() && token.len() <= MAX_TOKEN_BYTES as usize,
+        "Ulearn token is empty or too large"
+    );
+    header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| anyhow::anyhow!("Ulearn token contains invalid header characters"))?;
+    Ok(token.to_owned())
+}
+
+fn validate_refresh_days(days: u32) -> Result<()> {
+    ensure!(
+        (1..=365).contains(&days),
+        "Token refresh days must be from 1 to 365"
+    );
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    value.get("exp")?.as_u64()
+}
+
+fn persist_refreshed_token(path: &Path, previous: &str, next: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Token file has no parent directory")?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("Could not create private token file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .write_all(next.as_bytes())
+        .context("Could not save renewed token")?;
+    temporary.as_file().sync_all()?;
+    ensure!(
+        read_token_file(path)?.trim() == previous,
+        "Token file changed during renewal; newer local credential was not overwritten"
+    );
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("Could not replace token file")?;
+    Ok(())
 }
 
 fn optional_env(name: &str) -> Result<Option<String>> {
@@ -307,10 +614,23 @@ fn outcome_error(message: &str, write: bool) -> anyhow::Error {
     }
 }
 
+#[derive(Debug)]
+struct HttpStatusError {
+    status: StatusCode,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&status_message(self.status))
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
 fn status_message(status: StatusCode) -> String {
     let hint = match status {
         StatusCode::UNAUTHORIZED => {
-            "authentication required or token expired; configure ULEARN_TOKEN or ULEARN_TOKEN_FILE"
+            "authentication required or token expired; run ulearn-mcp bootstrap --replace or update ULEARN_TOKEN"
         }
         StatusCode::FORBIDDEN => {
             "the account does not have permission for this course/student/action"

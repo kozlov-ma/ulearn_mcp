@@ -5,3 +5,4 @@
 *.token
 /secrets/
 /private/
+*.cookie

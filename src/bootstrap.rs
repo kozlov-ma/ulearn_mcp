@@ -79,7 +79,7 @@ fn normalize_token(input: &str) -> Result<&str> {
 pub async fn import_token(api_url: &str, input: &str, path: &Path, replace: bool) -> Result<()> {
     check_destination(path, replace)?;
     let token = normalize_token(input)?;
-    let client = UlearnClient::new(api_url, Some(token.to_owned()))?;
+    let client = UlearnClient::new(api_url, Some(token.to_owned()))?.without_auto_refresh();
     client
         .get(&["account"], &[])
         .await
@@ -133,16 +133,57 @@ fn client_config(binary: &Path, token_path: &Path, api: &str) -> Result<serde_js
     ensure!(binary.is_absolute(), "Executable path must be absolute");
     ensure!(token_path.is_absolute(), "Token file path must be absolute");
     UlearnClient::new(api, None)?;
-    Ok(
-        serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":{"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api}}}}),
-    )
+    let mut environment = serde_json::json!({"ULEARN_TOKEN_FILE":token_path,"ULEARN_API_URL":api});
+    for name in ["ULEARN_AUTO_REFRESH_TOKEN", "ULEARN_TOKEN_REFRESH_DAYS"] {
+        let value = match std::env::var(name) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => continue,
+            Err(_) => anyhow::bail!("{name} is not valid UTF-8"),
+        };
+        match name {
+            "ULEARN_AUTO_REFRESH_TOKEN" => ensure!(
+                matches!(value.as_str(), "true" | "false" | "1" | "0"),
+                "ULEARN_AUTO_REFRESH_TOKEN must be true or false"
+            ),
+            "ULEARN_TOKEN_REFRESH_DAYS" => ensure!(
+                value
+                    .parse::<u32>()
+                    .is_ok_and(|days| (1..=365).contains(&days)),
+                "ULEARN_TOKEN_REFRESH_DAYS must be an integer from 1 to 365"
+            ),
+            _ => unreachable!(),
+        }
+        environment[name] = value.into();
+    }
+    Ok(serde_json::json!({"mcpServers":{"ulearn":{"command":binary,"env":environment}}}))
 }
 
 /// Print-ready configuration without reading tokens or accessing the network.
 /// File authentication is intentional: never serialize ULEARN_TOKEN into config.
 pub fn configuration_from_env() -> Result<serde_json::Value> {
+    let explicit_session = std::env::var_os("ULEARN_SESSION_FILE").is_some();
+    let explicit_token = std::env::var_os("ULEARN_TOKEN_FILE").is_some()
+        || std::env::var_os("ULEARN_TOKEN").is_some();
+    ensure!(
+        !(explicit_session && explicit_token),
+        "Choose either ULEARN_SESSION_FILE or token authentication, not both"
+    );
+    if explicit_session {
+        return crate::session_bootstrap::configuration_from_env();
+    }
+    let api = crate::session_bootstrap::optional_env("ULEARN_API_URL")?
+        .unwrap_or_else(|| DEFAULT_API_URL.into());
+    let web = crate::session_bootstrap::optional_env("ULEARN_WEB_URL")?;
+    let default_session = !explicit_token
+        && api.trim_end_matches('/') == DEFAULT_API_URL
+        && web.as_deref().is_none_or(|url| {
+            url.trim_end_matches('/') == crate::session_bootstrap::DEFAULT_WEB_URL
+        })
+        && fs::symlink_metadata(crate::session_bootstrap::default_session_path()?).is_ok();
+    if default_session {
+        return crate::session_bootstrap::configuration_from_env();
+    }
     let path = configured_token_path(None)?;
-    let api = std::env::var("ULEARN_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
     client_config(&std::env::current_exe()?, &path, &api)
 }
 
@@ -194,7 +235,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         serde_json::to_string_pretty(&config)?
     );
     eprintln!(
-        "Повторно вывести JSON настройки: ulearn-mcp config. При стандартном пути и API токен подхватывается автоматически. Если MCP уже запущен, перезапустите его. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
+        "Повторно вывести JSON настройки: ulearn-mcp config. При стандартном пути и API токен подхватывается автоматически. Запущенный MCP подхватит замену файла токена при следующем запросе. ULEARN_TOKEN/ULEARN_TOKEN_FILE имеют приоритет."
     );
     Ok(())
 }
