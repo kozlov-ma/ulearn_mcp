@@ -239,3 +239,340 @@ async fn empty_identifiers_are_rejected_without_requests() {
     }
     assert!(api.received_requests().await.unwrap().is_empty());
 }
+
+fn session_jwt() -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86400;
+    format!(
+        "e30.{}.signature",
+        URL_SAFE_NO_PAD.encode(json!({"exp":exp}).to_string())
+    )
+}
+
+async fn session_auth(api: &MockServer) {
+    use wiremock::matchers::header;
+    let token = session_jwt();
+    Mock::given(method("POST"))
+        .and(path("/account/token"))
+        .and(header("cookie", "session=teacher"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"token":token})))
+        .expect(1)
+        .mount(api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/account"))
+        .and(header("authorization", format!("Bearer {token}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"isAuthenticated":true,"user":{"id":"teacher"}})),
+        )
+        .expect(1)
+        .mount(api)
+        .await;
+}
+
+async fn session_server(api: &MockServer, web: &MockServer) -> UlearnServer {
+    session_auth(api).await;
+    let session = ulearn_mcp::session::UlearnSession::from_cookie(
+        &api.uri(),
+        &web.uri(),
+        "session=teacher".into(),
+    )
+    .unwrap();
+    UlearnServer::new(UlearnClient::from_session(session).unwrap())
+}
+
+fn write_args() -> ulearn_mcp::server::ModuleScoreArgs {
+    ulearn_mcp::server::ModuleScoreArgs {
+        course_id: "course-a".into(),
+        unit_id: "unit-a".into(),
+        user_id: "student-a".into(),
+        scoring_group_id: "activity".into(),
+        score: Some(3),
+        expected_score: Some(1),
+        group_id: None,
+    }
+}
+
+async fn repeated_course(api: &MockServer, times: u64) {
+    Mock::given(method("GET"))
+        .and(path("/courses/course-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(course()))
+        .expect(times)
+        .mount(api)
+        .await;
+}
+
+async fn score_mutation(web: &MockServer, score: Option<i32>) {
+    use wiremock::matchers::{body_string, header};
+    Mock::given(method("POST"))
+        .and(path("/Admin/SetAdditionalScore"))
+        .and(header("cookie", "session=teacher"))
+        .and(query_param("courseId", "course-a"))
+        .and(query_param("unitId", "unit-a"))
+        .and(query_param("userId", "student-a"))
+        .and(query_param("scoringGroupId", "activity"))
+        .and(body_string(format!(
+            "score={}",
+            score.map(|n| n.to_string()).unwrap_or_default()
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"status":"ok","score":score.map(|n|json!(n)).unwrap_or(json!(""))}),
+        ))
+        .expect(1)
+        .mount(web)
+        .await;
+}
+
+#[tokio::test]
+async fn token_mode_cannot_edit_module_scores_or_silently_load_another_cookie() {
+    let api = MockServer::start().await;
+    let error = server(&api)
+        .set_module_score(Parameters(write_args()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("require session authentication"));
+    assert!(api.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scores_and_clear_use_one_session_for_api_preflight_write_and_readback() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for score in [Some(0), Some(3), None] {
+        let api = MockServer::start().await;
+        let web = MockServer::start().await;
+        let server = session_server(&api, &web).await;
+        repeated_course(&api, 2).await;
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/user-progress/course-a"))
+            .and(body_json(json!({"userIds":["student-a"]})))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(progress(
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Some(1)
+                    } else {
+                        score
+                    },
+                ))
+            })
+            .expect(2)
+            .mount(&api)
+            .await;
+        score_mutation(&web, score).await;
+        let mut request = write_args();
+        request.score = score;
+        let result = server
+            .set_module_score(Parameters(request))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(result["write_accepted"], true);
+        assert_eq!(result["score_verified"], true);
+        let api_requests = api.received_requests().await.unwrap();
+        let account = api_requests
+            .iter()
+            .find(|r| r.url.path() == "/account")
+            .unwrap();
+        for request in api_requests
+            .iter()
+            .filter(|r| r.url.path() != "/account/token")
+        {
+            assert!(!request.headers.contains_key("cookie"));
+            assert_eq!(
+                request.headers.get("authorization"),
+                account.headers.get("authorization")
+            );
+        }
+        let web_requests = web.received_requests().await.unwrap();
+        assert_eq!(web_requests.len(), 1);
+        assert!(!web_requests[0].headers.contains_key("authorization"));
+    }
+}
+
+#[tokio::test]
+async fn stale_out_of_range_disabled_and_malformed_scores_stop_before_mutation() {
+    for case in 0..4 {
+        let api = MockServer::start().await;
+        let web = MockServer::start().await;
+        let server = session_server(&api, &web).await;
+        let mut metadata = course();
+        let mut data = progress(Some(1));
+        let mut request = write_args();
+        match case {
+            0 => request.expected_score = Some(2),
+            1 => request.score = Some(5),
+            2 => {
+                metadata["units"][0]["additionalScores"][0]["canInstructorSetAdditionalScore"] =
+                    json!(false)
+            }
+            _ => {
+                data["userProgress"]["student-a"]["additionalScores"]["unit-a"]["activity"] =
+                    json!("1")
+            }
+        }
+        course_mock(&api, metadata).await;
+        progress_mock(&api, data).await;
+        assert!(server.set_module_score(Parameters(request)).await.is_err());
+        assert!(web.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unchanged_module_score_is_a_verified_no_op() {
+    let api = MockServer::start().await;
+    let web = MockServer::start().await;
+    let server = session_server(&api, &web).await;
+    course_mock(&api, course()).await;
+    progress_mock(&api, progress(Some(1))).await;
+    let mut request = write_args();
+    request.score = Some(1);
+    let result = server
+        .set_module_score(Parameters(request))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["score_verified"], true);
+    assert!(web.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_readback_preserves_accepted_write_and_never_retries_mutation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let api = MockServer::start().await;
+    let web = MockServer::start().await;
+    let server = session_server(&api, &web).await;
+    repeated_course(&api, 2).await;
+    let count = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/user-progress/course-a"))
+        .respond_with(move |_: &wiremock::Request| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(progress(Some(1)))
+            } else {
+                ResponseTemplate::new(503)
+            }
+        })
+        .expect(2)
+        .mount(&api)
+        .await;
+    score_mutation(&web, Some(3)).await;
+    let result = server
+        .set_module_score(Parameters(write_args()))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result["write_accepted"], true);
+    assert_eq!(result["score_verified"], false);
+    assert!(result["readback_error"].is_string());
+    assert_eq!(web.received_requests().await.unwrap().len(), 1);
+}
+
+fn save_session_file(path: &std::path::Path, content: &str) {
+    std::fs::write(path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn session_replacement_during_module_preflight_prevents_website_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.cookie");
+    save_session_file(&file, "session=teacher");
+    let api = MockServer::start().await;
+    let web = MockServer::start().await;
+    session_auth(&api).await;
+    let session =
+        ulearn_mcp::session::UlearnSession::from_file(&api.uri(), &web.uri(), file.clone())
+            .unwrap();
+    let server = UlearnServer::new(UlearnClient::from_session(session).unwrap());
+    course_mock(&api, course()).await;
+    Mock::given(method("POST"))
+        .and(path("/user-progress/course-a"))
+        .respond_with(move |_: &wiremock::Request| {
+            save_session_file(&file, "session=someone-else");
+            ResponseTemplate::new(200).set_body_json(progress(Some(1)))
+        })
+        .expect(1)
+        .mount(&api)
+        .await;
+    assert!(
+        server
+            .set_module_score(Parameters(write_args()))
+            .await
+            .is_err()
+    );
+    assert!(web.received_requests().await.unwrap().is_empty());
+    assert_eq!(api.received_requests().await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn review_mutation_also_pins_session_across_its_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.cookie");
+    save_session_file(&file, "session=teacher");
+    let api = MockServer::start().await;
+    let web = MockServer::start().await;
+    session_auth(&api).await;
+    let session =
+        ulearn_mcp::session::UlearnSession::from_file(&api.uri(), &web.uri(), file.clone())
+            .unwrap();
+    let server = UlearnServer::new(UlearnClient::from_session(session).unwrap());
+    Mock::given(method("GET"))
+        .and(path("/submissions"))
+        .respond_with(move |_: &wiremock::Request| {
+            save_session_file(&file, "session=someone-else");
+            ResponseTemplate::new(200).set_body_json(
+                json!({"submissions":[{"id":1,"code":"code","manualChecking":{"percent":null}}]}),
+            )
+        })
+        .expect(1)
+        .mount(&api)
+        .await;
+    let target = ulearn_mcp::server::ReviewTarget {
+        course_id: "course-a".into(),
+        slide_id: "task-a".into(),
+        user_id: "student-a".into(),
+        submission_id: 1,
+        expected_code_sha256: ulearn_mcp::server::code_hash("code"),
+        expected_percent: None,
+    };
+    let result = server
+        .set_review_score(Parameters(ulearn_mcp::server::ScoreArgs {
+            target,
+            percent: 75,
+        }))
+        .await;
+    assert!(result.is_err());
+    assert_eq!(api.received_requests().await.unwrap().len(), 3);
+}
+
+#[test]
+fn module_grade_precondition_is_required_and_clear_is_explicit() {
+    let incomplete = json!({"course_id":"course-a","unit_id":"unit-a","user_id":"student-a","scoring_group_id":"activity","score":null});
+    assert!(serde_json::from_value::<ulearn_mcp::server::ModuleScoreArgs>(incomplete).is_err());
+    let mut complete = json!({"course_id":"course-a","unit_id":"unit-a","user_id":"student-a","scoring_group_id":"activity","score":null,"expected_score":0});
+    assert!(
+        serde_json::from_value::<ulearn_mcp::server::ModuleScoreArgs>(complete.clone())
+            .unwrap()
+            .score
+            .is_none()
+    );
+    complete.as_object_mut().unwrap().remove("score");
+    assert!(serde_json::from_value::<ulearn_mcp::server::ModuleScoreArgs>(complete).is_err());
+}

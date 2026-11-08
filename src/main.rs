@@ -9,10 +9,13 @@ async fn main() -> anyhow::Result<()> {
     if args.first().is_some_and(|a| a == "bootstrap") {
         return ulearn_mcp::bootstrap::run(&args[1..]).await;
     }
+    if args.first().is_some_and(|a| a == "bootstrap-session") {
+        return ulearn_mcp::session_bootstrap::run(&args[1..]).await;
+    }
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             eprintln!(
-                "ulearn-mcp [bootstrap [TOKEN_FILE] [--replace] | config | refresh-token [--days N] | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nBootstrap: interactive token setup; use bootstrap --help for instructions.\nconfig: print MCP client JSON with absolute paths; no token reads or network requests.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_TOKEN or ULEARN_TOKEN_FILE, ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nThe default ~/.config/ulearn-mcp/ulearn.token is loaded automatically for api.ulearn.me. Without a token, only public course content is available."
+                "ulearn-mcp [bootstrap-session [SESSION_FILE] [--replace] | bootstrap [TOKEN_FILE] [--replace] | config [--session] | refresh-token [--days N] | --check | login TOKEN_FILE]\n\nDefault: MCP over stdio.\nbootstrap-session: recommended single-session setup; use --help for instructions.\nbootstrap: legacy API-token-only setup.\nconfig: print MCP client JSON with absolute paths; no credential reads or network requests.\n--check: verify account/token via GET /account.\n\nEnvironment: ULEARN_SESSION_FILE + ULEARN_WEB_URL, or ULEARN_TOKEN / ULEARN_TOKEN_FILE; ULEARN_API_URL (default https://api.ulearn.me).\nLogin: ulearn-mcp login /absolute/path/ulearn.token (hidden password prompt).\nFor production, the default ~/.config/ulearn-mcp/ulearn.cookie is preferred over ulearn.token; XDG_CONFIG_HOME is respected. Explicit authentication settings take priority. Without credentials, only public course content is available."
             );
             return Ok(());
         }
@@ -27,11 +30,14 @@ async fn main() -> anyhow::Result<()> {
             return login(Path::new(&path)).await;
         }
         Some("config") => {
-            anyhow::ensure!(args.len() == 1, "Usage: ulearn-mcp config");
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&ulearn_mcp::bootstrap::configuration_from_env()?)?
-            );
+            let config = match &args[1..] {
+                [] => ulearn_mcp::bootstrap::configuration_from_env()?,
+                [flag] if flag == "--session" => {
+                    ulearn_mcp::session_bootstrap::configuration_from_env()?
+                }
+                _ => anyhow::bail!("Usage: ulearn-mcp config [--session]"),
+            };
+            println!("{}", serde_json::to_string_pretty(&config)?);
             return Ok(());
         }
         Some("refresh-token") => {
@@ -41,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
                 && args.len() == 2
             {
                 println!(
-                    "ulearn-mcp refresh-token [--days N]\nRenew an unexpired instructor token via /account/api-token and save it to the configured token file. Default lifetime: 30 days (ULEARN_TOKEN_REFRESH_DAYS). Expired tokens require bootstrap --replace. The credential is never printed."
+                    "ulearn-mcp refresh-token [--days N]\nWith a session: obtain a fresh API token in memory via /account/token; --days is not supported. With a token file: renew via /account/api-token and save it (default 30 days, ULEARN_TOKEN_REFRESH_DAYS). Expired sessions require bootstrap-session --replace; expired standalone tokens require bootstrap --replace. Credentials are never printed."
                 );
                 return Ok(());
             }
@@ -55,14 +61,21 @@ async fn main() -> anyhow::Result<()> {
             };
             let client = UlearnClient::from_env()?;
             anyhow::ensure!(
-                client.has_token_file(),
-                "refresh-token requires a token file; use bootstrap or ULEARN_TOKEN_FILE so the new credential can be saved"
+                client.has_token_file() || client.has_session(),
+                "refresh-token requires a session or token file; use bootstrap-session or bootstrap"
             );
             let result = client.refresh_token(days).await?;
-            println!(
-                "Token renewed and saved. Expires at Unix timestamp {}. Running MCP servers reload the file on their next request.",
-                result["expires_at"]
-            );
+            if client.has_session() {
+                println!(
+                    "API token obtained from the session; stored only in memory. Expires at Unix timestamp {}. Running MCP servers obtain their own token automatically.",
+                    result["expires_at"]
+                );
+            } else {
+                println!(
+                    "Token renewed and saved. Expires at Unix timestamp {}. Running MCP servers reload the file on their next request.",
+                    result["expires_at"]
+                );
+            }
             return Ok(());
         }
         Some("--check") => {

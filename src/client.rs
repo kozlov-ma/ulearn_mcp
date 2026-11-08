@@ -4,6 +4,7 @@
 //! particular, failed writes are never retried: a lost response does not imply
 //! that a comment or a grade was not saved.
 
+use crate::session::{SessionSnapshot, UlearnSession};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Method, StatusCode, Url, header};
@@ -27,6 +28,8 @@ pub const DEFAULT_REFRESH_DAYS: u32 = 30;
 pub struct UlearnClient {
     client: Client,
     base_url: Url,
+    session: Option<UlearnSession>,
+    pinned_session: Option<SessionSnapshot>,
     token: Arc<Mutex<Option<String>>>,
     refresh_denied_token: Arc<Mutex<Option<String>>>,
     token_file: Option<PathBuf>,
@@ -40,6 +43,12 @@ impl UlearnClient {
             optional_env("ULEARN_API_URL")?.unwrap_or_else(|| DEFAULT_API_URL.to_owned());
         let direct_token = optional_env("ULEARN_TOKEN")?;
         let token_file = optional_env("ULEARN_TOKEN_FILE")?;
+        if let Some(session) = crate::session::session_from_env(
+            &base_url,
+            direct_token.is_some() || token_file.is_some(),
+        )? {
+            return Self::from_session(session);
+        }
         let token_file = match (direct_token.as_ref(), token_file) {
             (Some(_), Some(_)) => bail!("Set only one of ULEARN_TOKEN or ULEARN_TOKEN_FILE"),
             (_, Some(path)) => Some(PathBuf::from(path)),
@@ -72,6 +81,36 @@ impl UlearnClient {
             _ => bail!("ULEARN_AUTO_REFRESH_TOKEN must be true or false"),
         };
         Ok(client)
+    }
+
+    pub fn from_session(session: UlearnSession) -> Result<Self> {
+        let mut client = Self::new(session.api_url(), None)?;
+        client.session = Some(session);
+        Ok(client)
+    }
+
+    pub fn from_session_file(api_url: &str, web_url: &str, path: PathBuf) -> Result<Self> {
+        Self::from_session(UlearnSession::from_file(api_url, web_url, path)?)
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    pub async fn pin_session(&self) -> Result<Self> {
+        let session = self.session.as_ref().context("Module score editing requires a website session; run bootstrap-session and configure ULEARN_SESSION_FILE")?;
+        if let Some(snapshot) = &self.pinned_session {
+            snapshot.ensure_current()?;
+            return Ok(self.clone());
+        }
+        let snapshot = session.authenticate(false).await?;
+        let mut client = self.clone();
+        client.pinned_session = Some(snapshot);
+        Ok(client)
+    }
+
+    pub fn session_snapshot(&self) -> Option<SessionSnapshot> {
+        self.pinned_session.clone()
     }
 
     pub fn from_token_file(base_url: &str, path: PathBuf) -> Result<Self> {
@@ -118,6 +157,8 @@ impl UlearnClient {
         Ok(Self {
             client,
             base_url,
+            session: None,
+            pinned_session: None,
             token: Arc::new(Mutex::new(token)),
             refresh_denied_token: Arc::new(Mutex::new(None)),
             token_file: None,
@@ -158,6 +199,13 @@ impl UlearnClient {
 
     /// Renew an unexpired instructor token; never return the credential to callers.
     pub async fn refresh_token(&self, days: Option<u32>) -> Result<Value> {
+        if let Some(session) = &self.session {
+            ensure!(
+                days.is_none(),
+                "--days is only available for legacy bearer tokens; session token lifetime is controlled by ulearn"
+            );
+            return session.refresh().await;
+        }
         let days = days.unwrap_or(self.refresh_days);
         validate_refresh_days(days)?;
         let mut token = self.token.lock().await;
@@ -173,6 +221,15 @@ impl UlearnClient {
     }
 
     async fn prepared_token(&self) -> Result<Option<String>> {
+        if let Some(snapshot) = &self.pinned_session {
+            snapshot.ensure_current()?;
+            return Ok(Some(snapshot.bearer_token().to_owned()));
+        }
+        if let Some(session) = &self.session {
+            let snapshot = session.authenticate(false).await?;
+            snapshot.ensure_current()?;
+            return Ok(Some(snapshot.bearer_token().to_owned()));
+        }
         let mut token = self.token.lock().await;
         self.reload_token(&mut token)?;
         if self.auto_refresh
@@ -322,10 +379,22 @@ impl UlearnClient {
             self.prepared_token().await?
         };
         if method != Method::GET && token.is_none() && !login_request {
-            bail!("Ulearn writes require ULEARN_TOKEN or ULEARN_TOKEN_FILE");
+            bail!("Ulearn writes require a website session or ULEARN_TOKEN/ULEARN_TOKEN_FILE");
         }
-        self.send_request(method, segments, query, body, token.as_deref(), write)
-            .await
+        let result = self
+            .send_request(method, segments, query, body, token.as_deref(), write)
+            .await;
+        if let Err(error) = &result
+            && error
+                .downcast_ref::<HttpStatusError>()
+                .is_some_and(|error| error.status == StatusCode::UNAUTHORIZED)
+            && let (Some(session), Some(rejected)) = (&self.session, token.as_deref())
+        {
+            // Never replay this operation, especially writes. A later independent
+            // call may exchange the cookie again for a fresh API token.
+            session.invalidate_token(rejected).await;
+        }
+        result
     }
 
     async fn send_request(

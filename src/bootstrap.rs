@@ -161,8 +161,29 @@ fn client_config(binary: &Path, token_path: &Path, api: &str) -> Result<serde_js
 /// Print-ready configuration without reading tokens or accessing the network.
 /// File authentication is intentional: never serialize ULEARN_TOKEN into config.
 pub fn configuration_from_env() -> Result<serde_json::Value> {
+    let explicit_session = std::env::var_os("ULEARN_SESSION_FILE").is_some();
+    let explicit_token = std::env::var_os("ULEARN_TOKEN_FILE").is_some()
+        || std::env::var_os("ULEARN_TOKEN").is_some();
+    ensure!(
+        !(explicit_session && explicit_token),
+        "Choose either ULEARN_SESSION_FILE or token authentication, not both"
+    );
+    if explicit_session {
+        return crate::session_bootstrap::configuration_from_env();
+    }
+    let api = crate::session_bootstrap::optional_env("ULEARN_API_URL")?
+        .unwrap_or_else(|| DEFAULT_API_URL.into());
+    let web = crate::session_bootstrap::optional_env("ULEARN_WEB_URL")?;
+    let default_session = !explicit_token
+        && api.trim_end_matches('/') == DEFAULT_API_URL
+        && web.as_deref().is_none_or(|url| {
+            url.trim_end_matches('/') == crate::session_bootstrap::DEFAULT_WEB_URL
+        })
+        && fs::symlink_metadata(crate::session_bootstrap::default_session_path()?).is_ok();
+    if default_session {
+        return crate::session_bootstrap::configuration_from_env();
+    }
     let path = configured_token_path(None)?;
-    let api = std::env::var("ULEARN_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
     client_config(&std::env::current_exe()?, &path, &api)
 }
 
